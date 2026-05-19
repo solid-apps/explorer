@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>explorer</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://unpkg.com/xlogin"></script>
+</head>
+<body>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <h1>explorer</h1>
+      <span class="sub">files on your pod</span>
+      <span class="topbar-id" id="topbar-id" hidden></span>
+    </div>
+  </header>
+
+  <main>
+
+    <section class="urlbar">
+      <button class="nav-btn" id="btn-up" title="Up (parent container)">↑</button>
+      <button class="nav-btn" id="btn-back" title="Back" disabled>←</button>
+      <input id="url" type="text" placeholder="https://your-pod.example.com/public/" spellcheck="false">
+      <button class="nav-btn" id="btn-go">Go</button>
+    </section>
+
+    <nav class="breadcrumb" id="breadcrumb"></nav>
+
+    <section class="view">
+
+      <div class="listing-wrap">
+        <div class="listing-header">
+          <span class="col-name">name</span>
+          <span class="col-size">size</span>
+          <span class="col-modified">modified</span>
+        </div>
+        <ol class="listing" id="listing">
+          <li class="empty" id="empty">Enter a pod URL above and press Go.</li>
+        </ol>
+      </div>
+
+      <aside class="preview" id="preview" hidden>
+        <div class="preview-header">
+          <span class="preview-title" id="preview-title">—</span>
+          <button class="nav-btn" id="btn-close-preview" title="Close preview">×</button>
+        </div>
+        <div class="preview-meta" id="preview-meta"></div>
+        <div class="preview-body" id="preview-body"></div>
+      </aside>
+
+    </section>
+
+    <footer class="status" id="status">idle</footer>
+
+  </main>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
