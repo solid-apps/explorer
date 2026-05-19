@@ -18,8 +18,13 @@ const state = {
   history: [],          // back-button stack
   loading: false,
   selectedItem: null,   // child URL currently shown in preview
-  ownPod: null          // derived from xlogin identity when available
+  ownPod: null,         // derived from xlogin identity when available
+  items: [],            // current container's items (for keyboard nav)
+  focusedIndex: -1      // keyboard-focused index into items
 }
+
+const TRASH_PATH = '/private/.trash/'
+let toastTimer = null
 
 // --- auth + fetch helpers ---
 
@@ -99,8 +104,26 @@ function escapeHtml(s) {
 
 // --- listing fetch + render ---
 
-async function navigateTo(url, options = {}) {
-  if (!url) return
+function normaliseUrl(url) {
+  if (!url) return url
+  url = url.trim()
+  // If no scheme, default to http for localhost / IPs / dev, https otherwise
+  if (!/^[a-z]+:\/\//i.test(url)) {
+    const isLocal = /^(localhost|127\.0\.0\.1|0\.0\.0\.0|192\.168\.|10\.|172\.)/.test(url)
+    url = (isLocal ? 'http://' : 'https://') + url
+  }
+  return url
+}
+
+async function navigateTo(rawUrl, options = {}) {
+  if (!rawUrl) return
+  const url = normaliseUrl(rawUrl)
+  // Validate it parses at all before doing anything else
+  try { new URL(url) } catch {
+    setBusy(false, `invalid URL: ${rawUrl}`, 'error')
+    showToast(`Invalid URL: ${rawUrl}`, null, null, 4000)
+    return
+  }
   // Push current onto history unless this navigation is from the back button
   if (state.here && !options.fromBack && state.here !== url) {
     state.history.push(state.here)
@@ -168,10 +191,27 @@ function isContainerDoc(doc) {
 async function renderContainerFromDoc(doc, baseUrl) {
   const contains = doc['ldp:contains'] || doc['http://www.w3.org/ns/ldp#contains'] || doc['contains'] || []
   const arr = Array.isArray(contains) ? contains : [contains]
-  const items = arr.map(x => {
+  let items = arr.map(x => {
     if (typeof x === 'string') return { '@id': x }
     return x
   })
+  // Filter dotfiles (.acl, .meta, anything starting with .) — same convention as Finder.
+  // Tier B / C will add a "show hidden" toggle.
+  items = items.filter(item => {
+    const id = item['@id']
+    if (!id) return false
+    const name = id.replace(/\/$/, '').split('/').pop() || ''
+    return !name.startsWith('.')
+  })
+  // Sort: containers first, then by name (so keyboard nav order matches visual order)
+  items.sort((a, b) => {
+    const ac = isContainer(a['@id']) ? 0 : 1
+    const bc = isContainer(b['@id']) ? 0 : 1
+    if (ac !== bc) return ac - bc
+    return (a['@id'] || '').localeCompare(b['@id'] || '')
+  })
+  state.items = items
+  state.focusedIndex = -1
   renderListing(items, baseUrl)
 }
 
@@ -204,13 +244,6 @@ function renderListing(items, baseUrl) {
     renderEmpty(isContainer(baseUrl) ? 'Empty container.' : 'No items.')
     return
   }
-  // Sort: containers first, then by name
-  items.sort((a, b) => {
-    const ac = isContainer(a['@id']) ? 0 : 1
-    const bc = isContainer(b['@id']) ? 0 : 1
-    if (ac !== bc) return ac - bc
-    return (a['@id'] || '').localeCompare(b['@id'] || '')
-  })
   for (const item of items) {
     const id = item['@id']
     if (!id) continue
@@ -328,6 +361,10 @@ async function openPreview(url) {
 function hidePreview() {
   const pane = document.getElementById('preview')
   pane.hidden = true
+  // Reset content so we don't briefly flash the previous preview on reopen
+  document.getElementById('preview-title').textContent = ''
+  document.getElementById('preview-meta').innerHTML = ''
+  document.getElementById('preview-body').innerHTML = ''
 }
 
 // JSON-LD aware pretty-print: render URI values as clickable links.
@@ -482,7 +519,9 @@ function bindButtons() {
     const prev = state.history.pop()
     if (prev) navigateTo(prev, { fromBack: true })
   })
+  document.getElementById('btn-refresh').addEventListener('click', () => refresh())
   document.getElementById('btn-close-preview').addEventListener('click', hidePreview)
+  document.getElementById('toast-close').addEventListener('click', hideToast)
 
   // Delegate clicks on links inside the preview body to navigate within the app
   document.getElementById('preview-body').addEventListener('click', (e) => {
@@ -493,10 +532,180 @@ function bindButtons() {
   })
 }
 
+// --- refresh ---
+
+function refresh() {
+  if (!state.here) return
+  // Re-navigate to current URL without pushing onto history
+  navigateTo(state.here, { fromBack: true })
+}
+
+// --- delete (soft, with undo) ---
+
+async function softDelete(url) {
+  if (!url) return
+  if (isContainer(url)) {
+    showToast('Cannot delete containers yet (only resources).', null, null, 4000)
+    return
+  }
+  if (!meWebId()) {
+    showToast('Login required to delete.', null, null, 3000)
+    return
+  }
+  // Determine the trash destination on the user's own pod
+  if (!state.ownPod) {
+    showToast('Cannot find your pod root for trash. Login may be incomplete.', null, null, 4000)
+    return
+  }
+  const original = url
+  const name = decodeURIComponent(original.replace(/\/$/, '').split('/').pop() || 'untitled')
+  const ts = new Date().toISOString().replace(/[:.]/g, '-')
+  const trashUrl = `${state.ownPod}${TRASH_PATH}${ts}-${name}`
+  setBusy(true, 'moving to trash…')
+  try {
+    // Read source
+    const r = await authFetch(original)
+    if (!r.ok) throw new Error(`read source: ${r.status}`)
+    const ct = r.headers.get('content-type') || 'application/octet-stream'
+    const blob = await r.blob()
+    // Write to trash
+    const w = await authFetch(trashUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': ct },
+      body: blob
+    })
+    if (!w.ok) throw new Error(`write trash: ${w.status}`)
+    // Delete original
+    const d = await authFetch(original, { method: 'DELETE' })
+    if (!d.ok) {
+      // Best-effort cleanup of orphaned trash
+      authFetch(trashUrl, { method: 'DELETE' }).catch(() => {})
+      throw new Error(`delete original: ${d.status}`)
+    }
+    setBusy(false, 'idle')
+    // Refresh listing to drop the deleted item
+    refresh()
+    // Toast with undo
+    showToast(
+      `Moved “${name}” to Trash`,
+      'Undo',
+      () => undoSoftDelete(original, trashUrl, ct),
+      8000
+    )
+  } catch (e) {
+    setBusy(false, e.message, 'error')
+    showToast(`Couldn't delete: ${e.message}`, null, null, 5000)
+  }
+}
+
+async function undoSoftDelete(originalUrl, trashUrl, ct) {
+  setBusy(true, 'restoring…')
+  try {
+    const r = await authFetch(trashUrl)
+    if (!r.ok) throw new Error(`read trash: ${r.status}`)
+    const blob = await r.blob()
+    const w = await authFetch(originalUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': ct || 'application/octet-stream' },
+      body: blob
+    })
+    if (!w.ok) throw new Error(`restore: ${w.status}`)
+    // Clean up the trash copy
+    authFetch(trashUrl, { method: 'DELETE' }).catch(() => {})
+    setBusy(false, 'idle')
+    refresh()
+    showToast('Restored', null, null, 2000)
+  } catch (e) {
+    setBusy(false, e.message, 'error')
+    showToast(`Couldn't restore: ${e.message}`, null, null, 5000)
+  }
+}
+
+// --- toast ---
+
+function showToast(message, actionLabel, actionFn, durationMs = 5000) {
+  if (!message) return  // never show an empty toast
+  const el = document.getElementById('toast')
+  document.getElementById('toast-msg').textContent = message
+  const actionBtn = document.getElementById('toast-action')
+  if (actionLabel && actionFn) {
+    actionBtn.hidden = false
+    actionBtn.textContent = actionLabel
+    actionBtn.onclick = () => { hideToast(); actionFn() }
+  } else {
+    actionBtn.hidden = true
+    actionBtn.onclick = null
+  }
+  el.hidden = false
+  if (toastTimer) clearTimeout(toastTimer)
+  toastTimer = setTimeout(hideToast, durationMs)
+}
+
+function hideToast() {
+  document.getElementById('toast').hidden = true
+  if (toastTimer) { clearTimeout(toastTimer); toastTimer = null }
+}
+
+// --- keyboard nav ---
+
+function bindKeyboard() {
+  document.addEventListener('keydown', (e) => {
+    // Don't hijack keys when typing in a text field
+    const tag = (e.target.tagName || '').toLowerCase()
+    if (tag === 'input' || tag === 'textarea') return
+
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      focusItem(state.focusedIndex < 0 ? 0 : Math.min(state.focusedIndex + 1, state.items.length - 1))
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      focusItem(state.focusedIndex < 0 ? state.items.length - 1 : Math.max(state.focusedIndex - 1, 0))
+    } else if (e.key === 'Enter') {
+      if (state.focusedIndex < 0 || !state.items[state.focusedIndex]) return
+      e.preventDefault()
+      const id = state.items[state.focusedIndex]['@id']
+      if (isContainer(id)) navigateTo(id)
+      else { selectItem(id); openPreview(id).catch(err => setBusy(false, err.message, 'error')) }
+    } else if (e.key === 'Backspace') {
+      e.preventDefault()
+      const p = parentOf(state.here)
+      if (p) navigateTo(p)
+    } else if (e.key === 'Delete' || (e.key === 'Backspace' && e.metaKey)) {
+      if (state.focusedIndex < 0 || !state.items[state.focusedIndex]) return
+      e.preventDefault()
+      const id = state.items[state.focusedIndex]['@id']
+      softDelete(id)
+    } else if (e.key === 'Escape') {
+      e.preventDefault()
+      hidePreview()
+      hideToast()
+    } else if (e.key === 'r' || e.key === 'R') {
+      e.preventDefault()
+      refresh()
+    } else if (e.key === '/') {
+      e.preventDefault()
+      document.getElementById('url').focus()
+      document.getElementById('url').select()
+    }
+  })
+}
+
+function focusItem(index) {
+  state.focusedIndex = index
+  const items = document.querySelectorAll('#listing li')
+  items.forEach((li, i) => {
+    li.classList.toggle('kbd-focus', i === index)
+  })
+  if (items[index]) {
+    items[index].scrollIntoView({ block: 'nearest' })
+  }
+}
+
 // --- init ---
 
 function init() {
   bindButtons()
+  bindKeyboard()
   renderIdentity()
   watchLogin()
   refreshNavButtons()

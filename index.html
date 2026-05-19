@@ -20,8 +20,9 @@
   <main>
 
     <section class="urlbar">
+      <button class="nav-btn" id="btn-back" title="Back (Backspace)" disabled>←</button>
       <button class="nav-btn" id="btn-up" title="Up (parent container)">↑</button>
-      <button class="nav-btn" id="btn-back" title="Back" disabled>←</button>
+      <button class="nav-btn" id="btn-refresh" title="Refresh (R)">↻</button>
       <input id="url" type="text" placeholder="https://your-pod.example.com/public/" spellcheck="false">
       <button class="nav-btn" id="btn-go">Go</button>
     </section>
@@ -55,6 +56,13 @@
     <footer class="status" id="status">idle</footer>
 
   </main>
+
+  <!-- Toast (delete undo, etc.) — hidden until something needs saying -->
+  <div class="toast" id="toast" hidden>
+    <span class="toast-msg" id="toast-msg"></span>
+    <button class="toast-action" id="toast-action" hidden></button>
+    <button class="toast-close" id="toast-close" title="Dismiss">×</button>
+  </div>
 
   <script type="module" src="app.js"></script>
 </body>
