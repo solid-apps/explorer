@@ -33,6 +33,8 @@ const state = {
 
 const TRASH_PATH = '/private/.trash/'
 const LS_LAST_URL = 'explorer.lastUrl'
+const LS_PODS = 'explorer.pods'
+const LS_SIDEBAR_COLLAPSED = 'explorer.sidebarCollapsed'
 
 // Default starting URL. If the explorer page itself is served from a
 // localhost origin (e.g. JSS hosting the app at /apps/explorer on a
@@ -155,6 +157,7 @@ async function navigateTo(rawUrl, options = {}) {
   state.selectedItem = null
   syncUrl()
   renderBreadcrumb()
+  renderSidebar()
   // Remember the last successful URL so the next session opens here
   try { localStorage.setItem(LS_LAST_URL, url) } catch {}
   setBusy(true, `loading ${url}`)
@@ -165,6 +168,7 @@ async function navigateTo(rawUrl, options = {}) {
     // bodies even when the URL is missing its trailing slash.
     const r = await authFetch(url, { headers: { Accept: 'application/ld+json' } })
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
+    sidebarAutoAdd(state.here)
     const ct = (r.headers.get('content-type') || '').split(';')[0].trim()
     const isLdJson = ct === 'application/ld+json' || ct === 'application/json'
 
@@ -565,7 +569,7 @@ function watchLogin() {
   let last = meWebId()
   setInterval(() => {
     const now = meWebId()
-    if (now !== last) { last = now; renderIdentity() }
+    if (now !== last) { last = now; renderIdentity(); renderSidebar() }
   }, 500)
 }
 
@@ -1082,6 +1086,7 @@ async function uploadFiles(fileList) {
   const files = Array.from(fileList)
   let ok = 0
   let fail = 0
+  const failures = []  // { name, size, message }
   setBusy(true, `uploading 0 / ${files.length}…`)
   // Concurrency 3
   const queue = files.slice()
@@ -1089,8 +1094,8 @@ async function uploadFiles(fileList) {
     while (queue.length > 0) {
       const file = queue.shift()
       if (!file) return
+      const safeName = file.name.replace(/[/\\]/g, '-')
       try {
-        const safeName = file.name.replace(/[/\\]/g, '-')
         const url = state.here + encodeURIComponent(safeName)
         const ct = file.type || contentTypeFromName(safeName)
         const r = await authFetch(url, {
@@ -1098,10 +1103,22 @@ async function uploadFiles(fileList) {
           headers: { 'Content-Type': ct },
           body: file
         })
-        if (!r.ok) throw new Error(`${r.status}`)
+        if (!r.ok) {
+          // Pull a short body excerpt for the error message — JSS error
+          // payloads are usually JSON with a "message" field
+          let detail = ''
+          try {
+            const text = (await r.text()).slice(0, 240)
+            try { detail = JSON.parse(text).message || text } catch { detail = text }
+          } catch {}
+          if (r.status === 413) detail = 'file too large for server'
+          else if (r.status === 401 || r.status === 403) detail = 'forbidden — check login + ACL'
+          throw new Error(`HTTP ${r.status}${detail ? ' — ' + detail : ''}`)
+        }
         ok++
-      } catch {
+      } catch (e) {
         fail++
+        failures.push({ name: safeName, size: file.size, message: e.message })
       }
       setBusy(true, `uploading ${ok + fail} / ${files.length}…`)
     }
@@ -1111,8 +1128,12 @@ async function uploadFiles(fileList) {
   refresh()
   if (fail === 0) {
     showToast(`Uploaded ${ok} file${ok === 1 ? '' : 's'}`, null, null, 3000)
+  } else if (ok === 0 && fail === 1) {
+    const f = failures[0]
+    showToast(`Couldn't upload "${f.name}" (${formatBytes(f.size)}): ${f.message}`, null, null, 10000)
   } else {
-    showToast(`Uploaded ${ok}, failed ${fail}`, null, null, 5000)
+    const first = failures[0]
+    showToast(`Uploaded ${ok}, failed ${fail}. First: "${first.name}" — ${first.message}`, null, null, 10000)
   }
 }
 
@@ -1782,6 +1803,130 @@ function focusItem(index) {
   }
 }
 
+// --- sidebar (saved pods) ---
+//
+// Multi-pod browse: localStorage-backed list of pod origins, rendered
+// as a quick-jump column on the left. Click an entry → navigate to its
+// /public/ root. Auto-adds whatever origin you successfully navigate to,
+// so the list grows organically as you browse.
+
+function loadPods() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(LS_PODS) || '[]')
+    return Array.isArray(arr) ? arr : []
+  } catch { return [] }
+}
+
+function savePods(pods) {
+  try { localStorage.setItem(LS_PODS, JSON.stringify(pods)) } catch {}
+}
+
+function podLabelFromOrigin(origin) {
+  try { return new URL(origin).host } catch { return origin }
+}
+
+function originOfUrl(url) {
+  try { return new URL(url).origin } catch { return null }
+}
+
+function sidebarAddPod(origin) {
+  if (!origin) return false
+  const pods = loadPods()
+  if (pods.some(p => p.origin === origin)) return false
+  pods.push({
+    origin,
+    label: podLabelFromOrigin(origin),
+    addedAt: Date.now()
+  })
+  savePods(pods)
+  renderSidebar()
+  return true
+}
+
+function sidebarRemovePod(origin) {
+  const pods = loadPods().filter(p => p.origin !== origin)
+  savePods(pods)
+  renderSidebar()
+}
+
+function sidebarAutoAdd(url) {
+  const o = originOfUrl(url)
+  if (o) sidebarAddPod(o)
+}
+
+function renderSidebar() {
+  const listEl = document.getElementById('sidebar-list')
+  if (!listEl) return
+  const pods = loadPods()
+  listEl.innerHTML = ''
+  if (pods.length === 0) {
+    listEl.innerHTML = '<li class="sidebar-empty">No pods yet. Add one below or just navigate — visited pods are remembered.</li>'
+    return
+  }
+  const currentOrigin = state.here ? originOfUrl(state.here) : null
+  const ownOrigin = state.ownPod
+  pods.forEach(pod => {
+    const li = document.createElement('li')
+    li.className = 'sidebar-pod'
+    if (pod.origin === currentOrigin) li.classList.add('active')
+    if (pod.origin === ownOrigin) li.classList.add('authed')
+    li.innerHTML = `
+      <span class="sidebar-pod-dot"></span>
+      <span class="sidebar-pod-label"></span>
+      <button class="sidebar-pod-remove" title="Remove from sidebar">×</button>
+    `
+    const labelEl = li.querySelector('.sidebar-pod-label')
+    labelEl.textContent = pod.label
+    labelEl.title = pod.origin
+    li.addEventListener('click', (e) => {
+      if (e.target.closest('.sidebar-pod-remove')) return
+      navigateTo(pod.origin + '/public/')
+    })
+    li.querySelector('.sidebar-pod-remove').addEventListener('click', (e) => {
+      e.stopPropagation()
+      sidebarRemovePod(pod.origin)
+    })
+    listEl.appendChild(li)
+  })
+}
+
+function sidebarAddPrompt() {
+  const raw = prompt('Pod URL (e.g. https://alice.solidcommunity.net):')
+  if (!raw) return
+  const url = normaliseUrl(raw.trim())
+  const origin = originOfUrl(url)
+  if (!origin) {
+    showToast('Invalid URL.', null, null, 3000)
+    return
+  }
+  sidebarAddPod(origin)
+  navigateTo(origin + '/public/')
+}
+
+function toggleSidebar(force) {
+  const layout = document.querySelector('.layout')
+  if (!layout) return
+  const collapsed = force != null ? force : !layout.classList.contains('sidebar-collapsed')
+  layout.classList.toggle('sidebar-collapsed', collapsed)
+  try { localStorage.setItem(LS_SIDEBAR_COLLAPSED, collapsed ? '1' : '0') } catch {}
+}
+
+function bindSidebar() {
+  document.getElementById('btn-sidebar-add').addEventListener('click', sidebarAddPrompt)
+  document.getElementById('btn-sidebar-toggle').addEventListener('click', () => toggleSidebar())
+  let collapsed = false
+  try { collapsed = localStorage.getItem(LS_SIDEBAR_COLLAPSED) === '1' } catch {}
+  if (collapsed) toggleSidebar(true)
+  // First-run: seed with the default pod so the sidebar isn't empty
+  if (loadPods().length === 0) {
+    const def = originOfUrl(defaultUrl())
+    if (def) {
+      savePods([{ origin: def, label: podLabelFromOrigin(def), addedAt: Date.now() }])
+    }
+  }
+  renderSidebar()
+}
+
 // --- init ---
 
 function init() {
@@ -1789,6 +1934,7 @@ function init() {
   bindKeyboard()
   bindDragDrop()
   bindAclEditor()
+  bindSidebar()
   renderIdentity()
   watchLogin()
   refreshNavButtons()
