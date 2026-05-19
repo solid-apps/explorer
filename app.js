@@ -12,23 +12,45 @@
 //   7. cross-pod browse
 //   8. search + bulk
 
+function makePaneState() {
+  return {
+    here: null,
+    history: [],
+    items: [],
+    focusedIndex: -1,
+    selectedItem: null,
+    dragSource: null     // { url } when this pane originated a drag
+  }
+}
+
 const state = {
-  here: null,           // current URL (container or resource)
-  history: [],          // back-button stack
+  panes: [makePaneState(), makePaneState()],
+  activePane: 0,
+  split: false,
   loading: false,
-  selectedItem: null,   // child URL currently shown in preview
-  ownPod: null,         // derived from xlogin identity when available
-  items: [],            // current container's items (for keyboard nav)
-  focusedIndex: -1,     // keyboard-focused index into items
-  dragSource: null,     // url of row being dragged (drag-to-move)
+  ownPod: null,
   acl: {
     open: false,
-    target: null,       // URL whose access we're editing
-    aclUrl: null,       // <target>.acl
-    items: [],          // [{ subject:{type,value}, modes:Set, default:bool }]
-    inheritedFrom: null,// URL we read inherited ACL from (null if explicit)
+    target: null,
+    aclUrl: null,
+    items: [],
+    inheritedFrom: null,
     saving: false
   }
+}
+
+// Active pane state (most calls operate on whatever pane the user last
+// interacted with; explicit handlers can pass a paneIdx instead).
+function P(idx) { return state.panes[idx ?? state.activePane] }
+
+function paneEl(idx) {
+  return document.querySelector(`.pane[data-pane="${idx ?? state.activePane}"]`)
+}
+
+function paneIdxOfEl(el) {
+  if (!el) return state.activePane
+  const p = el.closest ? el.closest('.pane') : null
+  return p ? parseInt(p.dataset.pane, 10) : state.activePane
 }
 
 const TRASH_PATH = '/private/.trash/'
@@ -142,6 +164,7 @@ function normaliseUrl(url) {
 
 async function navigateTo(rawUrl, options = {}) {
   if (!rawUrl) return
+  const paneIdx = options.paneIdx ?? state.activePane
   const url = normaliseUrl(rawUrl)
   // Validate it parses at all before doing anything else
   try { new URL(url) } catch {
@@ -149,26 +172,27 @@ async function navigateTo(rawUrl, options = {}) {
     showToast(`Invalid URL: ${rawUrl}`, null, null, 4000)
     return
   }
+  const p = P(paneIdx)
   // Push current onto history unless this navigation is from the back button
-  if (state.here && !options.fromBack && state.here !== url) {
-    state.history.push(state.here)
+  if (p.here && !options.fromBack && p.here !== url) {
+    p.history.push(p.here)
   }
-  state.here = url
-  state.selectedItem = null
-  syncUrl()
-  renderBreadcrumb()
+  p.here = url
+  p.selectedItem = null
+  syncUrl(paneIdx)
+  renderBreadcrumb(paneIdx)
   renderSidebar()
   // Remember the last successful URL so the next session opens here
-  try { localStorage.setItem(LS_LAST_URL, url) } catch {}
+  // (only the active pane writes this — secondary pane is ephemeral)
+  if (paneIdx === 0) {
+    try { localStorage.setItem(LS_LAST_URL, url) } catch {}
+  }
   setBusy(true, `loading ${url}`)
-  hidePreview()
+  if (paneIdx === state.activePane) hidePreview()
   try {
-    // Fetch once with JSON-LD preference; decide listing vs preview from
-    // the response, not from URL shape. Solid pods return JSON-LD container
-    // bodies even when the URL is missing its trailing slash.
     const r = await authFetch(url, { headers: { Accept: 'application/ld+json' } })
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
-    sidebarAutoAdd(state.here)
+    sidebarAutoAdd(p.here)
     const ct = (r.headers.get('content-type') || '').split(';')[0].trim()
     const isLdJson = ct === 'application/ld+json' || ct === 'application/json'
 
@@ -177,32 +201,34 @@ async function navigateTo(rawUrl, options = {}) {
       let doc
       try { doc = JSON.parse(text) } catch { doc = null }
       if (doc && isContainerDoc(doc)) {
-        // Normalise URL to have a trailing slash so future navigation works
         if (!url.endsWith('/')) {
-          state.here = url + '/'
-          syncUrl()
-          renderBreadcrumb()
+          p.here = url + '/'
+          syncUrl(paneIdx)
+          renderBreadcrumb(paneIdx)
         }
-        await renderContainerFromDoc(doc, state.here)
+        await renderContainerFromDoc(doc, p.here, paneIdx)
         setBusy(false, 'idle')
-        refreshNavButtons()
+        refreshNavButtons(paneIdx)
         return
       }
-      // JSON resource (not a container) — show in preview pane
-      await openPreviewFromText(state.here, ct, text, r)
-      renderEmpty('—')
+      // Resource (not a container) — preview is global; only show if this is the active pane
+      if (paneIdx === state.activePane) {
+        await openPreviewFromText(p.here, ct, text, r)
+      }
+      renderEmpty('—', paneIdx)
     } else {
-      // Non-JSON resource — open preview, fetch fresh for the right blob
-      hidePreview()
-      await openPreview(state.here)
-      renderEmpty('—')
+      if (paneIdx === state.activePane) {
+        hidePreview()
+        await openPreview(p.here)
+      }
+      renderEmpty('—', paneIdx)
     }
     setBusy(false, 'idle')
   } catch (e) {
     setBusy(false, e.message, 'error')
-    renderEmpty(`Could not load: ${e.message}`)
+    renderEmpty(`Could not load: ${e.message}`, paneIdx)
   }
-  refreshNavButtons()
+  refreshNavButtons(paneIdx)
 }
 
 function isContainerDoc(doc) {
@@ -217,31 +243,30 @@ function isContainerDoc(doc) {
   )
 }
 
-async function renderContainerFromDoc(doc, baseUrl) {
+async function renderContainerFromDoc(doc, baseUrl, paneIdx) {
+  paneIdx = paneIdx ?? state.activePane
   const contains = doc['ldp:contains'] || doc['http://www.w3.org/ns/ldp#contains'] || doc['contains'] || []
   const arr = Array.isArray(contains) ? contains : [contains]
   let items = arr.map(x => {
     if (typeof x === 'string') return { '@id': x }
     return x
   })
-  // Filter dotfiles (.acl, .meta, anything starting with .) — same convention as Finder.
-  // Tier B / C will add a "show hidden" toggle.
   items = items.filter(item => {
     const id = item['@id']
     if (!id) return false
     const name = id.replace(/\/$/, '').split('/').pop() || ''
     return !name.startsWith('.')
   })
-  // Sort: containers first, then by name (so keyboard nav order matches visual order)
   items.sort((a, b) => {
     const ac = isContainer(a['@id']) ? 0 : 1
     const bc = isContainer(b['@id']) ? 0 : 1
     if (ac !== bc) return ac - bc
     return (a['@id'] || '').localeCompare(b['@id'] || '')
   })
-  state.items = items
-  state.focusedIndex = -1
-  renderListing(items, baseUrl)
+  const p = P(paneIdx)
+  p.items = items
+  p.focusedIndex = -1
+  renderListing(items, baseUrl, paneIdx)
 }
 
 async function openPreviewFromText(url, ct, text, response) {
@@ -266,11 +291,12 @@ async function openPreviewFromText(url, ct, text, response) {
   }
 }
 
-function renderListing(items, baseUrl) {
-  const listEl = document.getElementById('listing')
+function renderListing(items, baseUrl, paneIdx) {
+  paneIdx = paneIdx ?? state.activePane
+  const listEl = paneEl(paneIdx).querySelector('.listing')
   listEl.innerHTML = ''
   if (items.length === 0) {
-    renderEmpty(isContainer(baseUrl) ? 'Empty container.' : 'No items.')
+    renderEmpty(isContainer(baseUrl) ? 'Empty container.' : 'No items.', paneIdx)
     return
   }
   for (const item of items) {
@@ -282,6 +308,7 @@ function renderListing(items, baseUrl) {
     const modified = item['dcterms:modified'] ?? item['http://purl.org/dc/terms/modified']
     const li = document.createElement('li')
     li.dataset.url = id
+    li.dataset.pane = String(paneIdx)
     li.innerHTML = `
       <span class="row-name">
         <span class="row-icon ${isC ? 'container' : ''}">${isC ? '▸' : '·'}</span>
@@ -291,82 +318,108 @@ function renderListing(items, baseUrl) {
       <span class="row-meta">${isC ? '—' : formatBytes(size)}</span>
       <span class="row-meta">${formatDate(modified)}</span>
     `
-    // Clicking the chip opens the ACL editor without selecting the row
     const chip = li.querySelector('.row-acl')
     chip.addEventListener('click', (e) => {
       e.preventDefault()
       e.stopPropagation()
+      setActivePane(paneIdx)
       openAclEditor(id)
     })
     aclEnqueue(id)
-    li.dataset.url = id
     li.draggable = true
     li.addEventListener('click', (e) => {
       e.preventDefault()
+      setActivePane(paneIdx)
       if (isC) {
-        navigateTo(id)
+        navigateTo(id, { paneIdx })
       } else {
-        // Open preview without navigation
-        selectItem(id)
+        selectItem(id, paneIdx)
         openPreview(id).catch(err => setBusy(false, err.message, 'error'))
       }
     })
     li.addEventListener('dblclick', (e) => {
       e.preventDefault()
-      // Double-click on the name → rename (Finder convention).
-      // Double-click elsewhere on a resource row → open full-page.
       const onName = e.target.closest('.row-label')
       if (onName) {
-        beginRename(li)
+        beginRename(li, paneIdx)
       } else if (!isC) {
-        navigateTo(id)
+        navigateTo(id, { paneIdx })
       }
     })
-    // Drag-drop: row → another container row → move
+    // Drag source — remember which pane originated the drag, so the
+    // drop handler can decide MOVE (same pane/origin) vs COPY (cross).
     li.addEventListener('dragstart', (e) => {
-      state.dragSource = id
-      e.dataTransfer.effectAllowed = 'move'
+      P(paneIdx).dragSource = { url: id }
+      e.dataTransfer.effectAllowed = 'copyMove'
       e.dataTransfer.setData('text/plain', id)
+      e.dataTransfer.setData('application/x-explorer-source', JSON.stringify({ url: id, paneIdx }))
       li.classList.add('dragging')
     })
     li.addEventListener('dragend', () => {
-      state.dragSource = null
+      P(paneIdx).dragSource = null
       li.classList.remove('dragging')
       document.querySelectorAll('.drop-target').forEach(el => el.classList.remove('drop-target'))
     })
     if (isC) {
       li.addEventListener('dragover', (e) => {
-        if (!state.dragSource || state.dragSource === id) return
-        // Don't drop a container into itself or a descendant
-        if (state.dragSource.endsWith('/') && id.startsWith(state.dragSource)) return
+        const src = currentDragSource()
+        if (!src || src.url === id) return
+        // Don't drop a container into itself or its descendants — only
+        // matters when the source is within the same origin/pane tree.
+        if (sameOrigin(src.url, id) && src.url.endsWith('/') && id.startsWith(src.url)) return
         e.preventDefault()
-        e.dataTransfer.dropEffect = 'move'
+        e.dataTransfer.dropEffect = sameOrigin(src.url, id) ? 'move' : 'copy'
         li.classList.add('drop-target')
       })
       li.addEventListener('dragleave', () => li.classList.remove('drop-target'))
       li.addEventListener('drop', (e) => {
         e.preventDefault()
         li.classList.remove('drop-target')
-        const src = state.dragSource
-        if (!src || src === id) return
-        moveItem(src, id)
+        const src = currentDragSource(e)
+        if (!src || src.url === id) return
+        if (sameOrigin(src.url, id)) {
+          moveItem(src.url, id)
+        } else {
+          copyItemAcrossPods(src.url, id)
+        }
       })
     }
     listEl.appendChild(li)
   }
 }
 
-function renderEmpty(text) {
-  const listEl = document.getElementById('listing')
+function renderEmpty(text, paneIdx) {
+  paneIdx = paneIdx ?? state.activePane
+  const listEl = paneEl(paneIdx).querySelector('.listing')
   listEl.innerHTML = `<li class="empty">${escapeHtml(text)}</li>`
 }
 
-function selectItem(url) {
-  state.selectedItem = url
-  const items = document.querySelectorAll('#listing li')
-  items.forEach(li => {
+function selectItem(url, paneIdx) {
+  paneIdx = paneIdx ?? state.activePane
+  P(paneIdx).selectedItem = url
+  paneEl(paneIdx).querySelectorAll('.listing li').forEach(li => {
     li.classList.toggle('selected', li.dataset.url === url)
   })
+}
+
+// Lookup the in-flight drag source from either pane (or from the
+// drop-event's dataTransfer payload as a fallback for cross-window or
+// cross-process drags — not used today but kept harmless).
+function currentDragSource(event) {
+  for (let i = 0; i < state.panes.length; i++) {
+    if (state.panes[i].dragSource) return { ...state.panes[i].dragSource, paneIdx: i }
+  }
+  if (event && event.dataTransfer) {
+    try {
+      const raw = event.dataTransfer.getData('application/x-explorer-source')
+      if (raw) return JSON.parse(raw)
+    } catch {}
+  }
+  return null
+}
+
+function sameOrigin(a, b) {
+  try { return new URL(a).origin === new URL(b).origin } catch { return false }
 }
 
 // --- preview ---
@@ -477,12 +530,14 @@ function renderJsonLd(obj, indent = 0) {
 
 // --- breadcrumb ---
 
-function renderBreadcrumb() {
-  const el = document.getElementById('breadcrumb')
+function renderBreadcrumb(paneIdx) {
+  paneIdx = paneIdx ?? state.activePane
+  const el = paneEl(paneIdx).querySelector('.breadcrumb')
   el.innerHTML = ''
-  if (!state.here) return
+  const here = P(paneIdx).here
+  if (!here) return
   let u
-  try { u = new URL(state.here) } catch { return }
+  try { u = new URL(here) } catch { return }
   const segments = u.pathname.split('/').filter(s => s !== '')
   const origin = u.origin
   const append = (label, href) => {
@@ -491,7 +546,7 @@ function renderBreadcrumb() {
     a.href = '#'
     a.addEventListener('click', (e) => {
       e.preventDefault()
-      navigateTo(href)
+      navigateTo(href, { paneIdx })
     })
     el.appendChild(a)
   }
@@ -508,9 +563,7 @@ function renderBreadcrumb() {
     acc += seg + '/'
     append(seg, origin + acc)
   }
-  // If we're on a resource (no trailing slash), show the last segment plain
   if (!u.pathname.endsWith('/') && segments.length > 0) {
-    // The above loop already added the last segment as a "directory" — strip it & re-add as plain
     const lastIsDir = el.lastChild && el.lastChild.tagName === 'A'
     if (lastIsDir) {
       const lastSeg = segments[segments.length - 1]
@@ -524,13 +577,16 @@ function renderBreadcrumb() {
 
 // --- nav buttons ---
 
-function refreshNavButtons() {
-  document.getElementById('btn-back').disabled = state.history.length === 0
-  document.getElementById('btn-up').disabled = !parentOf(state.here)
+function refreshNavButtons(paneIdx) {
+  paneIdx = paneIdx ?? state.activePane
+  const el = paneEl(paneIdx)
+  el.querySelector('.btn-back').disabled = P(paneIdx).history.length === 0
+  el.querySelector('.btn-up').disabled = !parentOf(P(paneIdx).here)
 }
 
-function syncUrl() {
-  document.getElementById('url').value = state.here || ''
+function syncUrl(paneIdx) {
+  paneIdx = paneIdx ?? state.activePane
+  paneEl(paneIdx).querySelector('.url').value = P(paneIdx).here || ''
 }
 
 function setBusy(busy, text, kind) {
@@ -555,10 +611,9 @@ function renderIdentity() {
     pill.textContent = label
     pill.hidden = false
     state.ownPod = podFromWebId(id)
-    // If we don't have a current URL, default to user's own pod public root
-    if (!state.here && state.ownPod) {
+    if (!P(0).here && state.ownPod) {
       const guess = state.ownPod + '/public/'
-      document.getElementById('url').value = guess
+      paneEl(0).querySelector('.url').value = guess
     }
   } else {
     pill.hidden = true
@@ -576,51 +631,67 @@ function watchLogin() {
 // --- buttons ---
 
 function bindButtons() {
-  document.getElementById('btn-go').addEventListener('click', () => {
-    const v = document.getElementById('url').value.trim()
-    if (v) navigateTo(v)
-  })
-  document.getElementById('url').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      const v = e.target.value.trim()
-      if (v) navigateTo(v)
-    }
-  })
-  document.getElementById('btn-up').addEventListener('click', () => {
-    const p = parentOf(state.here)
-    if (p) navigateTo(p)
-  })
-  document.getElementById('btn-back').addEventListener('click', () => {
-    if (state.history.length === 0) return
-    const prev = state.history.pop()
-    if (prev) navigateTo(prev, { fromBack: true })
-  })
-  document.getElementById('btn-refresh').addEventListener('click', () => refresh())
-  document.getElementById('btn-close-preview').addEventListener('click', hidePreview)
-  document.getElementById('toast-close').addEventListener('click', hideToast)
+  // Bind per-pane controls. Both panes get the same handlers, each
+  // closed over its paneIdx.
+  document.querySelectorAll('.pane').forEach(pEl => {
+    const paneIdx = parseInt(pEl.dataset.pane, 10)
+    pEl.addEventListener('mousedown', () => setActivePane(paneIdx), { capture: true })
 
-  // New… menu
-  document.getElementById('btn-new').addEventListener('click', (e) => {
-    e.stopPropagation()
-    togglePopover()
+    pEl.querySelector('.btn-go').addEventListener('click', () => {
+      const v = pEl.querySelector('.url').value.trim()
+      if (v) { setActivePane(paneIdx); navigateTo(v, { paneIdx }) }
+    })
+    pEl.querySelector('.url').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        const v = e.target.value.trim()
+        if (v) { setActivePane(paneIdx); navigateTo(v, { paneIdx }) }
+      }
+    })
+    pEl.querySelector('.btn-up').addEventListener('click', () => {
+      const par = parentOf(P(paneIdx).here)
+      if (par) navigateTo(par, { paneIdx })
+    })
+    pEl.querySelector('.btn-back').addEventListener('click', () => {
+      if (P(paneIdx).history.length === 0) return
+      const prev = P(paneIdx).history.pop()
+      if (prev) navigateTo(prev, { paneIdx, fromBack: true })
+    })
+    pEl.querySelector('.btn-refresh').addEventListener('click', () => refresh(paneIdx))
+
+    // New… menu (per-pane popover)
+    pEl.querySelector('.btn-new').addEventListener('click', (e) => {
+      e.stopPropagation()
+      setActivePane(paneIdx)
+      togglePopover(undefined, paneIdx)
+    })
+    pEl.querySelectorAll('.popover-new .popover-item').forEach(btn => {
+      btn.addEventListener('click', () => {
+        togglePopover(false, paneIdx)
+        const action = btn.dataset.action
+        if (action === 'container') newContainer(paneIdx)
+        else if (action === 'file') newFile(paneIdx)
+        else if (action === 'upload') document.querySelector(`.file-picker[data-pane="${paneIdx}"]`).click()
+      })
+    })
+
+    const split = pEl.querySelector('.btn-split')
+    if (split) split.addEventListener('click', () => toggleSplit(true))
+    const close = pEl.querySelector('.btn-close-pane')
+    if (close) close.addEventListener('click', () => toggleSplit(false))
   })
-  document.querySelectorAll('#popover-new .popover-item').forEach(btn => {
-    btn.addEventListener('click', () => {
-      togglePopover(false)
-      const action = btn.dataset.action
-      if (action === 'container') newContainer()
-      else if (action === 'file') newFile()
-      else if (action === 'upload') document.getElementById('file-picker').click()
+
+  // Per-pane file pickers
+  document.querySelectorAll('.file-picker').forEach(picker => {
+    const paneIdx = parseInt(picker.dataset.pane, 10)
+    picker.addEventListener('change', (e) => {
+      uploadFiles(e.target.files, paneIdx)
+      e.target.value = ''
     })
   })
 
-  // File picker
-  document.getElementById('file-picker').addEventListener('change', (e) => {
-    uploadFiles(e.target.files)
-    e.target.value = ''  // reset so re-picking same file fires change
-  })
-
-  // Delegate clicks on links inside the preview body to navigate within the app
+  // Global controls
+  document.getElementById('btn-close-preview').addEventListener('click', hidePreview)
+  document.getElementById('toast-close').addEventListener('click', hideToast)
   document.getElementById('preview-body').addEventListener('click', (e) => {
     const a = e.target.closest('a[data-link]')
     if (!a) return
@@ -631,10 +702,50 @@ function bindButtons() {
 
 // --- refresh ---
 
-function refresh() {
-  if (!state.here) return
-  // Re-navigate to current URL without pushing onto history
-  navigateTo(state.here, { fromBack: true })
+function refresh(paneIdx) {
+  paneIdx = paneIdx ?? state.activePane
+  const here = P(paneIdx).here
+  if (!here) return
+  navigateTo(here, { paneIdx, fromBack: true })
+}
+
+// --- split mode ---
+
+function toggleSplit(force) {
+  const want = force != null ? force : !state.split
+  if (want === state.split) return
+  state.split = want
+  const right = paneEl(1)
+  right.hidden = !want
+  document.body.classList.toggle('split', want)
+  if (want) {
+    // Opening split closes any side panel — they can't share the right column
+    hidePreview()
+    if (state.acl.open) closeAclEditor()
+    // Seed pane 1 from pane 0 if it's empty
+    if (!P(1).here) {
+      const seed = P(0).here || defaultUrl()
+      paneEl(1).querySelector('.url').value = seed
+      navigateTo(seed, { paneIdx: 1 })
+    }
+  } else {
+    if (state.activePane === 1) setActivePane(0)
+  }
+  updatePaneActiveClass()
+}
+
+function setActivePane(idx) {
+  if (idx === state.activePane) return
+  if (!state.split && idx !== 0) return
+  state.activePane = idx
+  updatePaneActiveClass()
+}
+
+function updatePaneActiveClass() {
+  document.querySelectorAll('.pane').forEach(p => {
+    const i = parseInt(p.dataset.pane, 10)
+    p.classList.toggle('active', i === state.activePane)
+  })
 }
 
 // --- delete (soft, with undo) ---
@@ -643,25 +754,32 @@ function isInTrash(url) {
   return url && url.includes(TRASH_PATH)
 }
 
-async function softDelete(url) {
+// Refresh every pane currently showing the given container URL — keeps
+// both panes in sync after any mutation (delete, rename, copy).
+function refreshIfAffected(parentUrl) {
+  for (let i = 0; i < state.panes.length; i++) {
+    if (P(i).here === parentUrl) refresh(i)
+  }
+}
+
+async function softDelete(url, paneIdx) {
   if (!url) return
   if (!meWebId()) {
     showToast('Login required to delete.', null, null, 3000)
     return
   }
-  // Inside trash: permanent delete (skip the roundtrip)
-  if (isInTrash(url)) return permanentDelete(url)
+  if (isInTrash(url)) return permanentDelete(url, paneIdx)
   if (!state.ownPod) {
     showToast('Cannot find your pod root for trash. Login may be incomplete.', null, null, 4000)
     return
   }
   if (isContainer(url)) {
-    return softDeleteContainer(url)
+    return softDeleteContainer(url, paneIdx)
   }
-  return softDeleteResource(url)
+  return softDeleteResource(url, paneIdx)
 }
 
-async function permanentDelete(url) {
+async function permanentDelete(url, paneIdx) {
   const name = decodeURIComponent(url.replace(/\/$/, '').split('/').pop() || '')
   const isC = isContainer(url)
   if (!confirm(`Permanently delete "${name}${isC ? '/' : ''}"? This cannot be undone.`)) return
@@ -683,7 +801,7 @@ async function permanentDelete(url) {
       if (!r.ok) throw new Error(`${r.status}`)
     }
     setBusy(false, 'idle')
-    refresh()
+    refreshIfAffected(parentOf(url))
     showToast(`Permanently deleted "${name}"`, null, null, 2500)
   } catch (e) {
     setBusy(false, e.message, 'error')
@@ -754,7 +872,7 @@ async function renameItem(srcUrl, newName) {
   return destUrl
 }
 
-function beginRename(li) {
+function beginRename(li, paneIdx) {
   if (!li) return
   const url = li.dataset.url
   if (!url || isInTrash(url)) return  // can't rename in trash
@@ -794,13 +912,12 @@ function beginRename(li) {
     try {
       await renameItem(url, newName)
       setBusy(false, 'idle')
-      refresh()
+      refreshIfAffected(parentOf(url))
       showToast(`Renamed to "${newName}"`, null, null, 2500)
     } catch (e) {
       setBusy(false, e.message, 'error')
       showToast(`Couldn't rename: ${e.message}`, null, null, 5000)
-      // Force refresh to recover from any partial state
-      refresh()
+      refreshIfAffected(parentOf(url))
     }
   }
   input.addEventListener('keydown', (e) => {
@@ -829,13 +946,67 @@ async function moveItem(srcUrl, targetContainerUrl) {
   try {
     await copyAndDelete(srcUrl, destUrl)
     setBusy(false, 'idle')
-    refresh()
+    refreshIfAffected(parentOf(srcUrl))
+    refreshIfAffected(targetContainerUrl)
     showToast(`Moved "${name}" → ${decodeURIComponent(targetContainerUrl.split('/').slice(-2, -1)[0] || '/')}/`, null, null, 2500)
   } catch (e) {
     setBusy(false, e.message, 'error')
     showToast(`Couldn't move: ${e.message}`, null, null, 5000)
-    refresh()
+    refreshIfAffected(parentOf(srcUrl))
+    refreshIfAffected(targetContainerUrl)
   }
+}
+
+// Cross-pod copy: keeps source intact (no DELETE). Used when drag
+// crosses an origin boundary in split mode.
+async function copyItemAcrossPods(srcUrl, targetContainerUrl) {
+  if (!targetContainerUrl.endsWith('/')) targetContainerUrl += '/'
+  const trailing = isContainer(srcUrl) ? '/' : ''
+  const name = decodeURIComponent(srcUrl.replace(/\/$/, '').split('/').pop() || '')
+  const destUrl = targetContainerUrl + encodeURIComponent(name) + trailing
+  if (destUrl === srcUrl) return
+  setBusy(true, `copying "${name}" across pods…`)
+  try {
+    if (isContainer(srcUrl)) {
+      const containers = []
+      const leaves = []
+      await walkTree(srcUrl, containers, leaves)
+      let done = 0
+      for (const leaf of leaves) {
+        const rel = leaf.slice(srcUrl.length)
+        await copyResource(leaf, destUrl + rel)
+        done++
+        setBusy(true, `copying ${done} / ${leaves.length}…`)
+      }
+    } else {
+      await copyResource(srcUrl, destUrl)
+    }
+    setBusy(false, 'idle')
+    refreshIfAffected(targetContainerUrl)
+    showToast(`Copied "${name}" to ${new URL(targetContainerUrl).host}`, null, null, 3000)
+  } catch (e) {
+    setBusy(false, e.message, 'error')
+    showToast(`Couldn't copy: ${e.message}`, null, null, 5000)
+  }
+}
+
+async function copyResource(srcUrl, destUrl) {
+  try {
+    const h = await authFetch(destUrl, { method: 'HEAD' })
+    if (h.ok) throw new Error(`destination exists: ${destUrl.split('/').pop()}`)
+  } catch (e) {
+    if (e.message.startsWith('destination exists')) throw e
+  }
+  const r = await authFetch(srcUrl)
+  if (!r.ok) throw new Error(`read source: ${r.status}`)
+  const ct = r.headers.get('content-type') || 'application/octet-stream'
+  const blob = await r.blob()
+  const w = await authFetch(destUrl, {
+    method: 'PUT',
+    headers: { 'Content-Type': ct },
+    body: blob
+  })
+  if (!w.ok) throw new Error(`write dest: ${w.status}`)
 }
 
 async function softDeleteResource(url) {
@@ -862,7 +1033,7 @@ async function softDeleteResource(url) {
       throw new Error(`delete original: ${d.status}`)
     }
     setBusy(false, 'idle')
-    refresh()
+    refreshIfAffected(parentOf(original))
     showToast(
       `Moved “${name}” to Trash`,
       'Undo',
@@ -914,7 +1085,7 @@ async function softDeleteContainer(url) {
       await authFetch(c, { method: 'DELETE' }).catch(() => {})  // best-effort
     }
     setBusy(false, 'idle')
-    refresh()
+    refreshIfAffected(parentOf(url))
     const n = restores.length
     showToast(
       `Moved "${name}" (${n} item${n === 1 ? '' : 's'}) to Trash`,
@@ -962,7 +1133,8 @@ async function undoSoftDelete(restores) {
       authFetch(trashUrl, { method: 'DELETE' }).catch(() => {})
     }
     setBusy(false, 'idle')
-    refresh()
+    // Refresh any pane showing the parent of the first restored item
+    if (restores[0]) refreshIfAffected(parentOf(restores[0].originalUrl))
     showToast('Restored', null, null, 2000)
   } catch (e) {
     setBusy(false, e.message, 'error')
@@ -972,8 +1144,10 @@ async function undoSoftDelete(restores) {
 
 // --- create container / file ---
 
-async function newContainer() {
-  if (!isContainer(state.here)) {
+async function newContainer(paneIdx) {
+  paneIdx = paneIdx ?? state.activePane
+  const here = P(paneIdx).here
+  if (!isContainer(here)) {
     showToast('Navigate to a container first.', null, null, 3000)
     return
   }
@@ -986,8 +1160,7 @@ async function newContainer() {
   }
   setBusy(true, 'creating container…')
   try {
-    // LDP POST: server creates a child container based on Slug + Link
-    const r = await authFetch(state.here, {
+    const r = await authFetch(here, {
       method: 'POST',
       headers: {
         'Content-Type': 'text/turtle',
@@ -998,7 +1171,7 @@ async function newContainer() {
     })
     if (!r.ok) throw new Error(`POST → ${r.status}`)
     setBusy(false, 'idle')
-    refresh()
+    refresh(paneIdx)
     showToast(`Created "${name}/"`, null, null, 2500)
   } catch (e) {
     setBusy(false, e.message, 'error')
@@ -1040,8 +1213,10 @@ function contentTypeFromName(name) {
   return EXTENSION_TYPES[ext] || 'application/octet-stream'
 }
 
-async function newFile() {
-  if (!isContainer(state.here)) {
+async function newFile(paneIdx) {
+  paneIdx = paneIdx ?? state.activePane
+  const here = P(paneIdx).here
+  if (!isContainer(here)) {
     showToast('Navigate to a container first.', null, null, 3000)
     return
   }
@@ -1053,7 +1228,7 @@ async function newFile() {
     return
   }
   const ct = contentTypeFromName(name)
-  const url = state.here + encodeURIComponent(name)
+  const url = here + encodeURIComponent(name)
   setBusy(true, 'creating file…')
   try {
     const r = await authFetch(url, {
@@ -1063,7 +1238,7 @@ async function newFile() {
     })
     if (!r.ok) throw new Error(`PUT → ${r.status}`)
     setBusy(false, 'idle')
-    refresh()
+    refresh(paneIdx)
     showToast(`Created "${name}"`, null, null, 2500)
   } catch (e) {
     setBusy(false, e.message, 'error')
@@ -1073,9 +1248,11 @@ async function newFile() {
 
 // --- upload ---
 
-async function uploadFiles(fileList) {
+async function uploadFiles(fileList, paneIdx) {
+  paneIdx = paneIdx ?? state.activePane
+  const here = P(paneIdx).here
   if (!fileList || fileList.length === 0) return
-  if (!isContainer(state.here)) {
+  if (!isContainer(here)) {
     showToast('Navigate to a container first.', null, null, 3000)
     return
   }
@@ -1096,7 +1273,7 @@ async function uploadFiles(fileList) {
       if (!file) return
       const safeName = file.name.replace(/[/\\]/g, '-')
       try {
-        const url = state.here + encodeURIComponent(safeName)
+        const url = here + encodeURIComponent(safeName)
         const ct = file.type || contentTypeFromName(safeName)
         const r = await authFetch(url, {
           method: 'PUT',
@@ -1125,7 +1302,7 @@ async function uploadFiles(fileList) {
   }
   await Promise.all([worker(), worker(), worker()])
   setBusy(false, 'idle')
-  refresh()
+  refresh(paneIdx)
   if (fail === 0) {
     showToast(`Uploaded ${ok} file${ok === 1 ? '' : 's'}`, null, null, 3000)
   } else if (ok === 0 && fail === 1) {
@@ -1657,12 +1834,14 @@ function bindAclEditor() {
 
 // --- popover ---
 
-function togglePopover(force) {
-  const pop = document.getElementById('popover-new')
+function togglePopover(force, paneIdx) {
+  paneIdx = paneIdx ?? state.activePane
+  const pop = paneEl(paneIdx).querySelector('.popover-new')
   const open = force != null ? force : pop.hidden
+  // Close any other open popovers first (single popover at a time)
+  document.querySelectorAll('.popover-new').forEach(el => { if (el !== pop) el.hidden = true })
   pop.hidden = !open
   if (open) {
-    // close on outside click
     setTimeout(() => {
       document.addEventListener('click', closeOnOutside, { once: true })
     }, 0)
@@ -1670,38 +1849,44 @@ function togglePopover(force) {
 }
 function closeOnOutside(e) {
   const host = e.target.closest('.popover-host')
-  if (!host) togglePopover(false)
+  if (!host) {
+    document.querySelectorAll('.popover-new').forEach(el => { el.hidden = true })
+  }
 }
 
 // --- drag-drop ---
 
 function bindDragDrop() {
-  const wrap = document.getElementById('listing-wrap')
-  const overlay = document.getElementById('drop-overlay')
-  let counter = 0  // dragenter/leave can fire on children; use ref-count
-  wrap.addEventListener('dragenter', (e) => {
-    if (!e.dataTransfer || !e.dataTransfer.types.includes('Files')) return
-    counter++
-    overlay.hidden = false
-  })
-  wrap.addEventListener('dragleave', () => {
-    counter--
-    if (counter <= 0) {
+  document.querySelectorAll('.pane').forEach(pEl => {
+    const paneIdx = parseInt(pEl.dataset.pane, 10)
+    const wrap = pEl.querySelector('.listing-wrap')
+    const overlay = pEl.querySelector('.drop-overlay')
+    let counter = 0
+    wrap.addEventListener('dragenter', (e) => {
+      if (!e.dataTransfer || !e.dataTransfer.types.includes('Files')) return
+      counter++
+      overlay.hidden = false
+    })
+    wrap.addEventListener('dragleave', () => {
+      counter--
+      if (counter <= 0) {
+        counter = 0
+        overlay.hidden = true
+      }
+    })
+    wrap.addEventListener('dragover', (e) => {
+      if (!e.dataTransfer || !e.dataTransfer.types.includes('Files')) return
+      e.preventDefault()
+      e.dataTransfer.dropEffect = 'copy'
+    })
+    wrap.addEventListener('drop', (e) => {
+      if (!e.dataTransfer || !e.dataTransfer.files || e.dataTransfer.files.length === 0) return
+      e.preventDefault()
       counter = 0
       overlay.hidden = true
-    }
-  })
-  wrap.addEventListener('dragover', (e) => {
-    if (!e.dataTransfer || !e.dataTransfer.types.includes('Files')) return
-    e.preventDefault()
-    e.dataTransfer.dropEffect = 'copy'
-  })
-  wrap.addEventListener('drop', (e) => {
-    if (!e.dataTransfer || !e.dataTransfer.files || e.dataTransfer.files.length === 0) return
-    e.preventDefault()
-    counter = 0
-    overlay.hidden = true
-    uploadFiles(e.dataTransfer.files)
+      setActivePane(paneIdx)
+      uploadFiles(e.dataTransfer.files, paneIdx)
+    })
   })
 }
 
@@ -1734,31 +1919,37 @@ function hideToast() {
 
 function bindKeyboard() {
   document.addEventListener('keydown', (e) => {
-    // Don't hijack keys when typing in a text field
     const tag = (e.target.tagName || '').toLowerCase()
     if (tag === 'input' || tag === 'textarea') return
 
+    const paneIdx = state.activePane
+    const p = P(paneIdx)
+    const pEl = paneEl(paneIdx)
+
     if (e.key === 'ArrowDown') {
       e.preventDefault()
-      focusItem(state.focusedIndex < 0 ? 0 : Math.min(state.focusedIndex + 1, state.items.length - 1))
+      focusItem(p.focusedIndex < 0 ? 0 : Math.min(p.focusedIndex + 1, p.items.length - 1), paneIdx)
     } else if (e.key === 'ArrowUp') {
       e.preventDefault()
-      focusItem(state.focusedIndex < 0 ? state.items.length - 1 : Math.max(state.focusedIndex - 1, 0))
+      focusItem(p.focusedIndex < 0 ? p.items.length - 1 : Math.max(p.focusedIndex - 1, 0), paneIdx)
     } else if (e.key === 'Enter') {
-      if (state.focusedIndex < 0 || !state.items[state.focusedIndex]) return
+      if (p.focusedIndex < 0 || !p.items[p.focusedIndex]) return
       e.preventDefault()
-      const id = state.items[state.focusedIndex]['@id']
-      if (isContainer(id)) navigateTo(id)
-      else { selectItem(id); openPreview(id).catch(err => setBusy(false, err.message, 'error')) }
+      const id = p.items[p.focusedIndex]['@id']
+      if (isContainer(id)) navigateTo(id, { paneIdx })
+      else { selectItem(id, paneIdx); openPreview(id).catch(err => setBusy(false, err.message, 'error')) }
+    } else if (e.key === 'Tab' && state.split) {
+      e.preventDefault()
+      setActivePane(state.activePane === 0 ? 1 : 0)
     } else if (e.key === 'Backspace') {
       e.preventDefault()
-      const p = parentOf(state.here)
-      if (p) navigateTo(p)
+      const par = parentOf(p.here)
+      if (par) navigateTo(par, { paneIdx })
     } else if (e.key === 'Delete' || (e.key === 'Backspace' && e.metaKey)) {
-      if (state.focusedIndex < 0 || !state.items[state.focusedIndex]) return
+      if (p.focusedIndex < 0 || !p.items[p.focusedIndex]) return
       e.preventDefault()
-      const id = state.items[state.focusedIndex]['@id']
-      softDelete(id)
+      const id = p.items[p.focusedIndex]['@id']
+      softDelete(id, paneIdx)
     } else if (e.key === 'Escape') {
       e.preventDefault()
       if (state.acl.open) closeAclEditor()
@@ -1766,35 +1957,36 @@ function bindKeyboard() {
       hideToast()
     } else if (e.key === 'r' || e.key === 'R') {
       e.preventDefault()
-      refresh()
+      refresh(paneIdx)
     } else if (e.key === '/') {
       e.preventDefault()
-      document.getElementById('url').focus()
-      document.getElementById('url').select()
+      const inp = pEl.querySelector('.url')
+      inp.focus(); inp.select()
     } else if (e.key === 'n' || e.key === 'N') {
       e.preventDefault()
-      togglePopover(true)
+      togglePopover(true, paneIdx)
     } else if (e.key === 'u' || e.key === 'U') {
       e.preventDefault()
-      document.getElementById('file-picker').click()
+      document.querySelector(`.file-picker[data-pane="${paneIdx}"]`).click()
     } else if (e.key === 'F2') {
-      if (state.focusedIndex < 0 || !state.items[state.focusedIndex]) return
+      if (p.focusedIndex < 0 || !p.items[p.focusedIndex]) return
       e.preventDefault()
-      const id = state.items[state.focusedIndex]['@id']
-      const li = document.querySelector(`#listing li[data-url="${CSS.escape(id)}"]`)
-      beginRename(li)
+      const id = p.items[p.focusedIndex]['@id']
+      const li = pEl.querySelector(`.listing li[data-url="${CSS.escape(id)}"]`)
+      beginRename(li, paneIdx)
     } else if (e.key === 'a' || e.key === 'A') {
-      if (state.focusedIndex < 0 || !state.items[state.focusedIndex]) return
+      if (p.focusedIndex < 0 || !p.items[p.focusedIndex]) return
       e.preventDefault()
-      const id = state.items[state.focusedIndex]['@id']
+      const id = p.items[p.focusedIndex]['@id']
       openAclEditor(id)
     }
   })
 }
 
-function focusItem(index) {
-  state.focusedIndex = index
-  const items = document.querySelectorAll('#listing li')
+function focusItem(index, paneIdx) {
+  paneIdx = paneIdx ?? state.activePane
+  P(paneIdx).focusedIndex = index
+  const items = paneEl(paneIdx).querySelectorAll('.listing li')
   items.forEach((li, i) => {
     li.classList.toggle('kbd-focus', i === index)
   })
@@ -1863,12 +2055,13 @@ function renderSidebar() {
     listEl.innerHTML = '<li class="sidebar-empty">No pods yet. Add one below or just navigate — visited pods are remembered.</li>'
     return
   }
-  const currentOrigin = state.here ? originOfUrl(state.here) : null
+  // Active if any pane currently shows this origin
+  const activeOrigins = new Set(state.panes.map(pp => pp.here ? originOfUrl(pp.here) : null).filter(Boolean))
   const ownOrigin = state.ownPod
   pods.forEach(pod => {
     const li = document.createElement('li')
     li.className = 'sidebar-pod'
-    if (pod.origin === currentOrigin) li.classList.add('active')
+    if (activeOrigins.has(pod.origin)) li.classList.add('active')
     if (pod.origin === ownOrigin) li.classList.add('authed')
     li.innerHTML = `
       <span class="sidebar-pod-dot"></span>
@@ -1952,10 +2145,10 @@ function init() {
   }
   if (!startUrl && meWebId() && state.ownPod) startUrl = state.ownPod + '/public/'
   if (!startUrl) startUrl = defaultUrl()
-  // Sync the placeholder to match the dynamic default so unfamiliar
-  // users see the right hint when no value is filled.
-  document.getElementById('url').placeholder = defaultUrl()
-  navigateTo(startUrl)
+  // Sync placeholders on both panes
+  document.querySelectorAll('.pane .url').forEach(el => { el.placeholder = defaultUrl() })
+  updatePaneActiveClass()
+  navigateTo(startUrl, { paneIdx: 0 })
 }
 
 if (document.readyState === 'loading') {

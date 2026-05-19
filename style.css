@@ -347,16 +347,39 @@ main {
   user-select: none;
 }
 
-/* — view: listing + preview — */
+/* — view: panes + preview/acl-editor — */
 
 .view {
   display: grid;
   grid-template-columns: 1fr;
   gap: 16px;
 }
+.view:has(.pane[data-pane="1"]:not([hidden])),
 .view:has(.preview:not([hidden])),
 .view:has(.acl-editor:not([hidden])) {
   grid-template-columns: 1fr 1fr;
+}
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+/* Active-pane indicator: only meaningful when split is on. The active
+   pane gets a subtle accent ring on its urlbar so the user knows which
+   pane the keyboard, popover, and global UI commands target. */
+body.split .pane.active .urlbar {
+  border-color: var(--selection-strong);
+  box-shadow: 0 0 0 3px var(--selection), var(--shadow-sm);
+}
+body.split .pane:not(.active) .listing-wrap {
+  opacity: 0.94;
+}
+
+.btn-split, .btn-close-pane {
+  font-size: 12px;
 }
 
 /* — listing — */
