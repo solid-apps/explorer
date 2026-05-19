@@ -26,6 +26,11 @@
   box-sizing: border-box;
 }
 
+/* HTML's [hidden] attribute is `display: none`. Any rule that sets
+   display (e.g. flex on .preview / .toast) overrides it; restore the
+   intended behaviour. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   padding: 0;
@@ -358,6 +363,67 @@ main {
 }
 .status.error {
   color: #b1431d;
+}
+
+/* — toast — */
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  transform: translateX(-50%);
+  background: var(--text);
+  color: #fafaf6;
+  border-radius: 10px;
+  padding: 10px 14px 10px 18px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-size: 13px;
+  box-shadow: var(--shadow-md);
+  z-index: 1000;
+  animation: toast-rise 220ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+@keyframes toast-rise {
+  from { opacity: 0; transform: translate(-50%, 8px); }
+  to   { opacity: 1; transform: translate(-50%, 0); }
+}
+.toast-msg {
+  font-feature-settings: "tnum";
+  letter-spacing: 0;
+}
+.toast-action {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: #fafaf6;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.toast-action:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.4);
+}
+.toast-close {
+  background: transparent;
+  border: 0;
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 18px;
+  line-height: 1;
+  padding: 0 4px;
+}
+.toast-close:hover { color: #fff; }
+
+/* — keyboard focus on a listing row — */
+
+.listing li:focus,
+.listing li.kbd-focus {
+  outline: none;
+  background: var(--selection-strong);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 
 /* — responsive — */
