@@ -32,42 +32,81 @@
 
   <main>
 
-    <section class="urlbar">
-      <button class="nav-btn" id="btn-back" title="Back (Backspace)" disabled>←</button>
-      <button class="nav-btn" id="btn-up" title="Up (parent container)">↑</button>
-      <button class="nav-btn" id="btn-refresh" title="Refresh (R)">↻</button>
-      <input id="url" type="text" placeholder="http://localhost:4443/public/" spellcheck="false">
-      <button class="nav-btn" id="btn-go">Go</button>
-      <span class="urlbar-sep"></span>
-      <div class="popover-host">
-        <button class="nav-btn" id="btn-new" title="New… (N)">＋</button>
-        <div class="popover" id="popover-new" hidden>
-          <button class="popover-item" data-action="container">New container</button>
-          <button class="popover-item" data-action="file">New file</button>
-          <button class="popover-item" data-action="upload">Upload files…</button>
-        </div>
-      </div>
-    </section>
-
-    <!-- Hidden file input used by both 'Upload…' menu item and U key -->
-    <input type="file" id="file-picker" multiple hidden>
-
-    <nav class="breadcrumb" id="breadcrumb"></nav>
+    <!-- Hidden file inputs — one per pane for upload via popover -->
+    <input type="file" class="file-picker" data-pane="0" multiple hidden>
+    <input type="file" class="file-picker" data-pane="1" multiple hidden>
 
     <section class="view">
 
-      <div class="listing-wrap" id="listing-wrap">
-        <div class="listing-header">
-          <span class="col-name">name</span>
-          <span class="col-acl" title="Who has access">access</span>
-          <span class="col-size">size</span>
-          <span class="col-modified">modified</span>
+      <!-- Pane 0 (primary, always visible) -->
+      <div class="pane" data-pane="0">
+        <section class="urlbar">
+          <button class="nav-btn btn-back" title="Back (Backspace)" disabled>←</button>
+          <button class="nav-btn btn-up" title="Up (parent container)">↑</button>
+          <button class="nav-btn btn-refresh" title="Refresh (R)">↻</button>
+          <input class="url" type="text" placeholder="http://localhost:4443/public/" spellcheck="false">
+          <button class="nav-btn btn-go">Go</button>
+          <span class="urlbar-sep"></span>
+          <div class="popover-host">
+            <button class="nav-btn btn-new" title="New… (N)">＋</button>
+            <div class="popover popover-new" hidden>
+              <button class="popover-item" data-action="container">New container</button>
+              <button class="popover-item" data-action="file">New file</button>
+              <button class="popover-item" data-action="upload">Upload files…</button>
+            </div>
+          </div>
+          <button class="nav-btn btn-split" title="Split view">⊟</button>
+        </section>
+        <nav class="breadcrumb"></nav>
+        <div class="listing-wrap">
+          <div class="listing-header">
+            <span class="col-name">name</span>
+            <span class="col-acl" title="Who has access">access</span>
+            <span class="col-size">size</span>
+            <span class="col-modified">modified</span>
+          </div>
+          <ol class="listing">
+            <li class="empty">Enter a pod URL above and press Go.</li>
+          </ol>
+          <div class="drop-overlay" hidden>
+            <div class="drop-overlay-inner">Drop to upload</div>
+          </div>
         </div>
-        <ol class="listing" id="listing">
-          <li class="empty" id="empty">Enter a pod URL above and press Go.</li>
-        </ol>
-        <div class="drop-overlay" id="drop-overlay" hidden>
-          <div class="drop-overlay-inner">Drop to upload</div>
+      </div>
+
+      <!-- Pane 1 (secondary, hidden until split is enabled) -->
+      <div class="pane" data-pane="1" hidden>
+        <section class="urlbar">
+          <button class="nav-btn btn-back" title="Back" disabled>←</button>
+          <button class="nav-btn btn-up" title="Up">↑</button>
+          <button class="nav-btn btn-refresh" title="Refresh">↻</button>
+          <input class="url" type="text" placeholder="http://localhost:4443/public/" spellcheck="false">
+          <button class="nav-btn btn-go">Go</button>
+          <span class="urlbar-sep"></span>
+          <div class="popover-host">
+            <button class="nav-btn btn-new" title="New…">＋</button>
+            <div class="popover popover-new" hidden>
+              <button class="popover-item" data-action="container">New container</button>
+              <button class="popover-item" data-action="file">New file</button>
+              <button class="popover-item" data-action="upload">Upload files…</button>
+            </div>
+          </div>
+          <button class="nav-btn btn-close-pane" title="Close split">×</button>
+        </section>
+        <nav class="breadcrumb"></nav>
+        <div class="listing-wrap">
+          <div class="listing-header">
+            <span class="col-name">name</span>
+            <span class="col-acl" title="Who has access">access</span>
+            <span class="col-size">size</span>
+            <span class="col-modified">modified</span>
+          </div>
+          <ol class="listing">
+            <li class="empty">Enter a pod URL above and press Go.</li>
+          </ol>
+          <div class="drop-overlay" hidden>
+            <div class="drop-overlay-inner">Drop to upload</div>
+          </div>
         </div>
       </div>
 
