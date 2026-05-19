@@ -32,8 +32,21 @@ const state = {
 }
 
 const TRASH_PATH = '/private/.trash/'
-const DEFAULT_URL = 'http://localhost:4443/public/'
 const LS_LAST_URL = 'explorer.lastUrl'
+
+// Default starting URL. If the explorer page itself is served from a
+// localhost origin (e.g. JSS hosting the app at /apps/explorer on a
+// non-default port), use that origin so the pod port matches. Otherwise
+// fall back to the canonical local dev port.
+function defaultUrl() {
+  try {
+    const loc = window.location
+    if (/^(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/.test(loc.host)) {
+      return `${loc.protocol}//${loc.host}/public/`
+    }
+  } catch {}
+  return 'http://localhost:4443/public/'
+}
 let toastTimer = null
 
 // --- auth + fetch helpers ---
@@ -1792,7 +1805,10 @@ function init() {
     try { startUrl = localStorage.getItem(LS_LAST_URL) || null } catch { startUrl = null }
   }
   if (!startUrl && meWebId() && state.ownPod) startUrl = state.ownPod + '/public/'
-  if (!startUrl) startUrl = DEFAULT_URL
+  if (!startUrl) startUrl = defaultUrl()
+  // Sync the placeholder to match the dynamic default so unfamiliar
+  // users see the right hint when no value is filled.
+  document.getElementById('url').placeholder = defaultUrl()
   navigateTo(startUrl)
 }
 
