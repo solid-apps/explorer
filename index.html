@@ -46,6 +46,7 @@
       <div class="listing-wrap" id="listing-wrap">
         <div class="listing-header">
           <span class="col-name">name</span>
+          <span class="col-acl" title="Who has access">access</span>
           <span class="col-size">size</span>
           <span class="col-modified">modified</span>
         </div>
@@ -64,6 +65,21 @@
         </div>
         <div class="preview-meta" id="preview-meta"></div>
         <div class="preview-body" id="preview-body"></div>
+      </aside>
+
+      <aside class="acl-editor" id="acl-editor" hidden>
+        <div class="acl-header">
+          <span class="acl-title" id="acl-title">Permissions</span>
+          <button class="nav-btn" id="btn-close-acl" title="Close (Esc)">×</button>
+        </div>
+        <div class="acl-meta" id="acl-meta"></div>
+        <div class="acl-body" id="acl-body"></div>
+        <div class="acl-footer">
+          <button class="nav-btn" id="btn-acl-add" title="Add authorization">+ Add</button>
+          <span class="acl-spacer"></span>
+          <button class="nav-btn" id="btn-acl-cancel">Cancel</button>
+          <button class="nav-btn acl-save" id="btn-acl-save">Save</button>
+        </div>
       </aside>
 
     </section>

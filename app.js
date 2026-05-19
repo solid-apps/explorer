@@ -1,15 +1,14 @@
 // explorer — solid-apps/explorer
 //
 // Phase 1: container navigation + JSON-LD-aware preview.
-// Single pod, no multi-pod browse yet. xlogin in the topbar; authFetch
-// for any read that needs auth (private containers).
+// Phase 2: create / rename / delete / move / trash / upload / drag-drop.
+// Phase 4: per-row ACL chip + editor panel. Lazy-fetches each row's
+//          effective ACL (its own .acl, or inherits via parent default).
+//          Click a chip → side panel to add/edit/remove authorizations.
 //
 // Phases beyond this one (see README):
-//   2. operations (create / rename / delete / move / trash)
 //   3. preview pane media (image/audio/video/PDF)
-//   4. ACL editor
 //   5. subscribe + multi-user
-//   6. upload + drag-drop
 //   7. cross-pod browse
 //   8. search + bulk
 
@@ -21,7 +20,15 @@ const state = {
   ownPod: null,         // derived from xlogin identity when available
   items: [],            // current container's items (for keyboard nav)
   focusedIndex: -1,     // keyboard-focused index into items
-  dragSource: null      // url of row being dragged (drag-to-move)
+  dragSource: null,     // url of row being dragged (drag-to-move)
+  acl: {
+    open: false,
+    target: null,       // URL whose access we're editing
+    aclUrl: null,       // <target>.acl
+    items: [],          // [{ subject:{type,value}, modes:Set, default:bool }]
+    inheritedFrom: null,// URL we read inherited ACL from (null if explicit)
+    saving: false
+  }
 }
 
 const TRASH_PATH = '/private/.trash/'
@@ -263,9 +270,18 @@ function renderListing(items, baseUrl) {
         <span class="row-icon ${isC ? 'container' : ''}">${isC ? '▸' : '·'}</span>
         <span class="row-label">${escapeHtml(name)}${isC ? '/' : ''}</span>
       </span>
+      <span class="row-acl loading" title="Loading permissions…">…</span>
       <span class="row-meta">${isC ? '—' : formatBytes(size)}</span>
       <span class="row-meta">${formatDate(modified)}</span>
     `
+    // Clicking the chip opens the ACL editor without selecting the row
+    const chip = li.querySelector('.row-acl')
+    chip.addEventListener('click', (e) => {
+      e.preventDefault()
+      e.stopPropagation()
+      openAclEditor(id)
+    })
+    aclEnqueue(id)
     li.dataset.url = id
     li.draggable = true
     li.addEventListener('click', (e) => {
@@ -1087,6 +1103,524 @@ async function uploadFiles(fileList) {
   }
 }
 
+// --- ACL: parsing, chip loading, editor ---
+//
+// WAC (Web Access Control) lives in companion docs:
+//   - resource /foo  →  ACL at /foo.acl
+//   - container /foo/ →  ACL at /foo/.acl
+// If a resource has no own ACL, the closest ancestor container's ACL
+// applies via acl:default. We walk up until we find one or hit root.
+
+const ACL_NS = 'http://www.w3.org/ns/auth/acl#'
+const FOAF_NS = 'http://xmlns.com/foaf/0.1/'
+const MODES = ['Read', 'Write', 'Append', 'Control']
+
+// Per-URL ACL summary cache: { kind, chip, label, explicit, error? }
+const aclCache = new Map()
+const aclInFlight = new Set()
+const aclQueue = []
+const ACL_CONCURRENCY = 4
+let aclActiveWorkers = 0
+
+function aclUrlFor(url) {
+  // Both forms: /foo → /foo.acl ;  /foo/ → /foo/.acl
+  return url + '.acl'
+}
+
+function aclEnqueue(url) {
+  if (aclCache.has(url)) {
+    renderAclChip(url, aclCache.get(url))
+    return
+  }
+  if (aclInFlight.has(url)) return
+  aclInFlight.add(url)
+  aclQueue.push(url)
+  aclPump()
+}
+
+function aclPump() {
+  while (aclActiveWorkers < ACL_CONCURRENCY && aclQueue.length > 0) {
+    const url = aclQueue.shift()
+    aclActiveWorkers++
+    loadAclSummary(url).finally(() => {
+      aclInFlight.delete(url)
+      aclActiveWorkers--
+      aclPump()
+    })
+  }
+}
+
+async function loadAclSummary(url) {
+  // Use the WAC-Allow response header (HEAD) for a summary — no .acl
+  // fetch needed, works without auth. The .acl walk only runs when the
+  // editor opens (where we need full authorization detail).
+  try {
+    const r = await authFetch(url, { method: 'HEAD' })
+    const wac = r.headers.get('wac-allow')
+    if (wac) {
+      const summary = summariseWacAllow(wac)
+      aclCache.set(url, summary)
+      renderAclChip(url, summary)
+      return
+    }
+    throw new Error('no wac-allow header')
+  } catch (e) {
+    const sum = { kind: 'unknown', chip: '?', label: 'unknown', explicit: false, error: e.message }
+    aclCache.set(url, sum)
+    renderAclChip(url, sum)
+  }
+}
+
+function parseWacAllow(header) {
+  // wac-allow: user="read write", public="read"
+  const result = { user: new Set(), public: new Set() }
+  if (!header) return result
+  for (const part of header.split(',')) {
+    const m = part.trim().match(/^(\w+)\s*=\s*"([^"]*)"/)
+    if (!m) continue
+    const who = m[1]
+    const modes = m[2].split(/\s+/).filter(Boolean)
+    for (const mode of modes) {
+      if (who === 'user') result.user.add(mode)
+      else if (who === 'public') result.public.add(mode)
+    }
+  }
+  return result
+}
+
+function summariseWacAllow(header) {
+  const wac = parseWacAllow(header)
+  const publicRead = wac.public.has('read')
+  const userRead = wac.user.has('read')
+  const youWrite = wac.user.has('write') || wac.user.has('append')
+  if (publicRead) {
+    return { kind: 'public', chip: '🌐',
+      label: youWrite ? 'Public — anyone can read; you can write' : 'Public — anyone can read',
+      explicit: true }
+  }
+  if (userRead) {
+    return { kind: 'shared', chip: '👥',
+      label: youWrite ? 'Shared — logged-in users can read; you can write' : 'Shared — logged-in users can read',
+      explicit: true }
+  }
+  return { kind: 'private', chip: '🔒',
+    label: youWrite ? 'Private — you have write access' : 'Private — not accessible to you',
+    explicit: true }
+}
+
+// Walk up from targetUrl looking for an .acl. Returns
+// { aclUrl, doc, accessToUrl, explicit }.
+async function findEffectiveAcl(targetUrl) {
+  let cur = targetUrl
+  let first = true
+  while (cur) {
+    const aclUrl = aclUrlFor(cur)
+    let r
+    try {
+      r = await authFetch(aclUrl, { headers: { Accept: 'application/ld+json' } })
+    } catch (e) {
+      throw new Error(`network: ${e.message}`)
+    }
+    if (r.ok) {
+      const doc = await r.json().catch(() => null)
+      if (!doc) throw new Error('acl not JSON-LD')
+      return { aclUrl, doc, accessToUrl: cur, explicit: first }
+    }
+    if (r.status === 401 || r.status === 403) {
+      throw new Error(`forbidden (${r.status})`)
+    }
+    if (r.status !== 404) {
+      throw new Error(`HTTP ${r.status} on ${aclUrl}`)
+    }
+    first = false
+    if (cur === targetUrl && !cur.endsWith('/')) {
+      // For a resource, the next step up is its container, not strip-and-up.
+      cur = parentOf(cur)
+    } else {
+      cur = parentOf(cur)
+    }
+  }
+  throw new Error('no acl found')
+}
+
+// Normalise prefixed / expanded property names in JSON-LD ACL nodes.
+function aclProp(node, suffix) {
+  const keys = [`acl:${suffix}`, `${ACL_NS}${suffix}`, suffix]
+  for (const k of keys) {
+    if (node[k] != null) {
+      const v = node[k]
+      const arr = Array.isArray(v) ? v : [v]
+      return arr.map(x => typeof x === 'string' ? x : (x && x['@id'])).filter(Boolean)
+    }
+  }
+  return []
+}
+
+function aclTypes(node) {
+  const t = node['@type']
+  if (!t) return []
+  return Array.isArray(t) ? t : [t]
+}
+
+function isAuthorization(node) {
+  return aclTypes(node).some(t =>
+    t === 'Authorization' || t === 'acl:Authorization' || t === ACL_NS + 'Authorization'
+  )
+}
+
+function normaliseMode(uri) {
+  if (!uri) return null
+  let m = String(uri)
+  if (m.startsWith(ACL_NS)) m = m.slice(ACL_NS.length)
+  else if (m.startsWith('acl:')) m = m.slice(4)
+  return MODES.includes(m) ? m : null
+}
+
+function classifyAgentClass(uri) {
+  if (!uri) return null
+  if (uri === 'foaf:Agent' || uri === FOAF_NS + 'Agent') return 'public'
+  if (uri === 'acl:AuthenticatedAgent' || uri === ACL_NS + 'AuthenticatedAgent') return 'authenticated'
+  return null
+}
+
+function extractAuthorizations(doc) {
+  let nodes = []
+  if (Array.isArray(doc)) nodes = doc
+  else if (doc['@graph']) nodes = Array.isArray(doc['@graph']) ? doc['@graph'] : [doc['@graph']]
+  else nodes = [doc]
+  const auths = []
+  for (const n of nodes) {
+    if (!n || typeof n !== 'object') continue
+    if (!isAuthorization(n)) continue
+    const agents = aclProp(n, 'agent')
+    const classes = aclProp(n, 'agentClass').map(classifyAgentClass).filter(Boolean)
+    const modes = new Set(aclProp(n, 'mode').map(normaliseMode).filter(Boolean))
+    const defaults = aclProp(n, 'default')
+    auths.push({ id: n['@id'] || null, agents, classes, modes, hasDefault: defaults.length > 0 })
+  }
+  return auths
+}
+
+function summariseAcl(eff) {
+  const auths = extractAuthorizations(eff.doc)
+  const me = meWebId()
+  let hasPublic = false, hasAuth = false, hasOther = false
+  for (const a of auths) {
+    if (!a.modes.has('Read')) continue
+    if (a.classes.includes('public')) hasPublic = true
+    if (a.classes.includes('authenticated')) hasAuth = true
+    for (const ag of a.agents) {
+      if (ag !== me) hasOther = true
+    }
+  }
+  let kind, chip, label
+  if (hasPublic) { kind = 'public'; chip = '🌐'; label = 'Public' }
+  else if (hasAuth || hasOther) { kind = 'shared'; chip = '👥'; label = 'Shared' }
+  else { kind = 'private'; chip = '🔒'; label = 'Private' }
+  return { kind, chip, label, explicit: eff.explicit, inheritedFrom: eff.explicit ? null : eff.accessToUrl }
+}
+
+function renderAclChip(url, summary) {
+  const li = document.querySelector(`#listing li[data-url="${CSS.escape(url)}"]`)
+  if (!li) return
+  const chipEl = li.querySelector('.row-acl')
+  if (!chipEl) return
+  chipEl.textContent = summary.chip
+  chipEl.classList.toggle('inherited', !summary.explicit)
+  chipEl.classList.toggle('unknown', summary.kind === 'unknown')
+  chipEl.classList.remove('loading')
+  let tip = `${summary.label}`
+  if (summary.kind !== 'unknown') {
+    tip += summary.explicit ? ' (this resource)' : ` (inherited from ${summary.inheritedFrom || 'parent'})`
+  } else if (summary.error) {
+    tip = `Permissions: ${summary.error}`
+  }
+  tip += ' — click to edit'
+  chipEl.title = tip
+}
+
+// --- ACL editor ---
+
+async function openAclEditor(targetUrl) {
+  if (!targetUrl) return
+  if (!meWebId()) {
+    showToast('Login required to edit access.', null, null, 3000)
+    return
+  }
+  hidePreview()
+  const pane = document.getElementById('acl-editor')
+  pane.hidden = false
+  const titleEl = document.getElementById('acl-title')
+  const metaEl = document.getElementById('acl-meta')
+  const bodyEl = document.getElementById('acl-body')
+  const name = decodeURIComponent(targetUrl.replace(/\/$/, '').split('/').pop() || '/') +
+               (targetUrl.endsWith('/') ? '/' : '')
+  titleEl.textContent = `Permissions: ${name}`
+  metaEl.innerHTML = '<span>loading…</span>'
+  bodyEl.innerHTML = ''
+  state.acl.open = true
+  state.acl.target = targetUrl
+  state.acl.aclUrl = aclUrlFor(targetUrl)
+  state.acl.saving = false
+
+  try {
+    const eff = await findEffectiveAcl(targetUrl)
+    state.acl.inheritedFrom = eff.explicit ? null : eff.accessToUrl
+    const auths = extractAuthorizations(eff.doc)
+    state.acl.items = auths.map(a => {
+      // Each authorization gets one card. Multiple agents/classes on one
+      // authorization → split into separate cards for clarity.
+      // But for simplicity we just take the first subject and warn if more.
+      let subject
+      if (a.classes.includes('public')) subject = { type: 'public', value: '' }
+      else if (a.classes.includes('authenticated')) subject = { type: 'authenticated', value: '' }
+      else if (a.agents.length > 0) subject = { type: 'agent', value: a.agents[0] }
+      else subject = { type: 'agent', value: '' }
+      return {
+        subject,
+        modes: new Set(a.modes),
+        default: a.hasDefault,
+        extraAgents: a.agents.slice(1),     // preserved on save
+        extraClasses: a.classes.slice(1)
+      }
+    })
+    renderAclMeta()
+    renderAclCards()
+  } catch (e) {
+    metaEl.innerHTML = `<span class="acl-badge inherited">error</span> <span>${escapeHtml(e.message)}</span>`
+    bodyEl.innerHTML = `<div class="acl-empty">Could not load ACL. Save will create a new one.</div>`
+    state.acl.inheritedFrom = null
+    state.acl.items = []
+    renderAclCards()
+  }
+}
+
+function closeAclEditor() {
+  state.acl.open = false
+  state.acl.target = null
+  state.acl.items = []
+  document.getElementById('acl-editor').hidden = true
+}
+
+function renderAclMeta() {
+  const metaEl = document.getElementById('acl-meta')
+  const explicit = !state.acl.inheritedFrom
+  metaEl.innerHTML = ''
+  const badge = document.createElement('span')
+  badge.className = 'acl-badge' + (explicit ? '' : ' inherited')
+  badge.textContent = explicit ? 'Explicit' : 'Inherited'
+  metaEl.appendChild(badge)
+  const note = document.createElement('span')
+  if (explicit) {
+    note.textContent = `${state.acl.aclUrl}`
+  } else {
+    note.textContent = `from ${state.acl.inheritedFrom} — save creates an override`
+  }
+  metaEl.appendChild(note)
+}
+
+function renderAclCards() {
+  const bodyEl = document.getElementById('acl-body')
+  bodyEl.innerHTML = ''
+  if (state.acl.items.length === 0) {
+    const empty = document.createElement('div')
+    empty.className = 'acl-empty'
+    empty.textContent = 'No authorizations. Click + Add to grant access.'
+    bodyEl.appendChild(empty)
+    return
+  }
+  const isContainer = state.acl.target && state.acl.target.endsWith('/')
+  state.acl.items.forEach((item, idx) => {
+    bodyEl.appendChild(renderAclCard(item, idx, isContainer))
+  })
+}
+
+function renderAclCard(item, idx, isContainer) {
+  const card = document.createElement('div')
+  card.className = 'acl-card'
+  card.dataset.idx = idx
+
+  // Subject row
+  const r1 = document.createElement('div')
+  r1.className = 'acl-card-row'
+  r1.innerHTML = `
+    <span class="acl-card-label">Who</span>
+    <select class="acl-subject-type">
+      <option value="agent">Specific WebID</option>
+      <option value="public">Public (anyone)</option>
+      <option value="authenticated">Authenticated (any logged-in)</option>
+    </select>
+    <input type="text" class="acl-subject-value" placeholder="https://example.com/profile#me">
+  `
+  const sel = r1.querySelector('.acl-subject-type')
+  const inp = r1.querySelector('.acl-subject-value')
+  sel.value = item.subject.type
+  inp.value = item.subject.value || ''
+  inp.style.display = item.subject.type === 'agent' ? '' : 'none'
+  sel.addEventListener('change', () => {
+    item.subject.type = sel.value
+    inp.style.display = item.subject.type === 'agent' ? '' : 'none'
+    if (item.subject.type !== 'agent') item.subject.value = ''
+  })
+  inp.addEventListener('input', () => { item.subject.value = inp.value.trim() })
+
+  // Modes row
+  const r2 = document.createElement('div')
+  r2.className = 'acl-card-row'
+  r2.innerHTML = `<span class="acl-card-label">Modes</span>`
+  for (const m of MODES) {
+    const label = document.createElement('label')
+    label.className = 'acl-mode' + (item.modes.has(m) ? ' checked' : '')
+    const cb = document.createElement('input')
+    cb.type = 'checkbox'
+    cb.dataset.mode = m
+    cb.checked = item.modes.has(m)
+    cb.addEventListener('change', () => {
+      if (cb.checked) item.modes.add(m); else item.modes.delete(m)
+      label.classList.toggle('checked', cb.checked)
+    })
+    label.appendChild(cb)
+    label.appendChild(document.createTextNode(' ' + m))
+    r2.appendChild(label)
+  }
+
+  // Default + Remove row
+  const r3 = document.createElement('div')
+  r3.className = 'acl-card-row'
+  if (isContainer) {
+    const defLabel = document.createElement('label')
+    defLabel.className = 'acl-default'
+    const defCb = document.createElement('input')
+    defCb.type = 'checkbox'
+    defCb.checked = item.default
+    defCb.addEventListener('change', () => { item.default = defCb.checked })
+    defLabel.appendChild(defCb)
+    defLabel.appendChild(document.createTextNode(' Apply to contents (default)'))
+    r3.appendChild(defLabel)
+  }
+  const rm = document.createElement('button')
+  rm.className = 'acl-remove'
+  rm.type = 'button'
+  rm.textContent = 'Remove'
+  rm.addEventListener('click', () => {
+    state.acl.items.splice(idx, 1)
+    renderAclCards()
+  })
+  r3.appendChild(rm)
+
+  card.appendChild(r1)
+  card.appendChild(r2)
+  card.appendChild(r3)
+  return card
+}
+
+function aclAddItem() {
+  state.acl.items.push({
+    subject: { type: 'agent', value: meWebId() || '' },
+    modes: new Set(['Read']),
+    default: false,
+    extraAgents: [],
+    extraClasses: []
+  })
+  renderAclCards()
+}
+
+// Serialise current state.acl.items → JSON-LD ACL doc
+function serialiseAcl() {
+  const target = state.acl.target
+  const isContainer = target.endsWith('/')
+  const graph = []
+  state.acl.items.forEach((item, i) => {
+    const node = {
+      '@id': `#auth${i}`,
+      '@type': 'acl:Authorization',
+      'acl:accessTo': { '@id': target }
+    }
+    if (item.subject.type === 'public') {
+      node['acl:agentClass'] = [{ '@id': FOAF_NS + 'Agent' }, ...item.extraClasses.map(c =>
+        c === 'public' ? null : c === 'authenticated' ? { '@id': ACL_NS + 'AuthenticatedAgent' } : null
+      ).filter(Boolean)]
+    } else if (item.subject.type === 'authenticated') {
+      node['acl:agentClass'] = [{ '@id': ACL_NS + 'AuthenticatedAgent' }]
+    } else {
+      const agents = [item.subject.value, ...item.extraAgents].filter(Boolean)
+      if (agents.length > 0) node['acl:agent'] = agents.map(a => ({ '@id': a }))
+    }
+    node['acl:mode'] = [...item.modes].map(m => ({ '@id': ACL_NS + m }))
+    if (item.default && isContainer) {
+      node['acl:default'] = { '@id': target }
+    }
+    graph.push(node)
+  })
+  return {
+    '@context': { acl: ACL_NS, foaf: FOAF_NS },
+    '@graph': graph
+  }
+}
+
+function validateAclItems() {
+  for (let i = 0; i < state.acl.items.length; i++) {
+    const it = state.acl.items[i]
+    if (it.modes.size === 0) return `Card ${i + 1}: choose at least one mode.`
+    if (it.subject.type === 'agent' && !it.subject.value) return `Card ${i + 1}: enter a WebID.`
+    if (it.subject.type === 'agent' && !/^https?:\/\//.test(it.subject.value)) {
+      return `Card ${i + 1}: WebID must start with http(s)://`
+    }
+  }
+  // Warn if no one has Control — they'd lock themselves out
+  const hasControl = state.acl.items.some(it => it.modes.has('Control'))
+  if (!hasControl) {
+    if (!confirm('No authorization has Control. You will not be able to edit this ACL again. Continue?')) {
+      return 'cancelled'
+    }
+  }
+  return null
+}
+
+async function saveAcl() {
+  if (state.acl.saving) return
+  const err = validateAclItems()
+  if (err) {
+    if (err !== 'cancelled') showToast(err, null, null, 5000)
+    return
+  }
+  state.acl.saving = true
+  const saveBtn = document.getElementById('btn-acl-save')
+  saveBtn.disabled = true
+  saveBtn.textContent = 'Saving…'
+  setBusy(true, 'saving access…')
+  try {
+    const doc = serialiseAcl()
+    const body = JSON.stringify(doc, null, 2)
+    const r = await authFetch(state.acl.aclUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/ld+json' },
+      body
+    })
+    if (!r.ok) throw new Error(`PUT ${state.acl.aclUrl} → ${r.status}`)
+    aclCache.delete(state.acl.target)
+    const target = state.acl.target
+    closeAclEditor()
+    setBusy(false, 'idle')
+    showToast('Saved permissions', null, null, 2500)
+    aclEnqueue(target)
+  } catch (e) {
+    setBusy(false, e.message, 'error')
+    showToast(`Couldn't save: ${e.message}`, null, null, 5000)
+  } finally {
+    state.acl.saving = false
+    saveBtn.disabled = false
+    saveBtn.textContent = 'Save'
+  }
+}
+
+function bindAclEditor() {
+  document.getElementById('btn-close-acl').addEventListener('click', closeAclEditor)
+  document.getElementById('btn-acl-cancel').addEventListener('click', closeAclEditor)
+  document.getElementById('btn-acl-add').addEventListener('click', aclAddItem)
+  document.getElementById('btn-acl-save').addEventListener('click', saveAcl)
+}
+
 // --- popover ---
 
 function togglePopover(force) {
@@ -1193,7 +1727,8 @@ function bindKeyboard() {
       softDelete(id)
     } else if (e.key === 'Escape') {
       e.preventDefault()
-      hidePreview()
+      if (state.acl.open) closeAclEditor()
+      else hidePreview()
       hideToast()
     } else if (e.key === 'r' || e.key === 'R') {
       e.preventDefault()
@@ -1214,6 +1749,11 @@ function bindKeyboard() {
       const id = state.items[state.focusedIndex]['@id']
       const li = document.querySelector(`#listing li[data-url="${CSS.escape(id)}"]`)
       beginRename(li)
+    } else if (e.key === 'a' || e.key === 'A') {
+      if (state.focusedIndex < 0 || !state.items[state.focusedIndex]) return
+      e.preventDefault()
+      const id = state.items[state.focusedIndex]['@id']
+      openAclEditor(id)
     }
   })
 }
@@ -1235,6 +1775,7 @@ function init() {
   bindButtons()
   bindKeyboard()
   bindDragDrop()
+  bindAclEditor()
   renderIdentity()
   watchLogin()
   refreshNavButtons()
