@@ -20,7 +20,8 @@ const state = {
   selectedItem: null,   // child URL currently shown in preview
   ownPod: null,         // derived from xlogin identity when available
   items: [],            // current container's items (for keyboard nav)
-  focusedIndex: -1      // keyboard-focused index into items
+  focusedIndex: -1,     // keyboard-focused index into items
+  dragSource: null      // url of row being dragged (drag-to-move)
 }
 
 const TRASH_PATH = '/private/.trash/'
@@ -265,6 +266,8 @@ function renderListing(items, baseUrl) {
       <span class="row-meta">${isC ? '—' : formatBytes(size)}</span>
       <span class="row-meta">${formatDate(modified)}</span>
     `
+    li.dataset.url = id
+    li.draggable = true
     li.addEventListener('click', (e) => {
       e.preventDefault()
       if (isC) {
@@ -277,9 +280,45 @@ function renderListing(items, baseUrl) {
     })
     li.addEventListener('dblclick', (e) => {
       e.preventDefault()
-      // Double-click on resource: navigate to it (full page)
-      if (!isC) navigateTo(id)
+      // Double-click on the name → rename (Finder convention).
+      // Double-click elsewhere on a resource row → open full-page.
+      const onName = e.target.closest('.row-label')
+      if (onName) {
+        beginRename(li)
+      } else if (!isC) {
+        navigateTo(id)
+      }
     })
+    // Drag-drop: row → another container row → move
+    li.addEventListener('dragstart', (e) => {
+      state.dragSource = id
+      e.dataTransfer.effectAllowed = 'move'
+      e.dataTransfer.setData('text/plain', id)
+      li.classList.add('dragging')
+    })
+    li.addEventListener('dragend', () => {
+      state.dragSource = null
+      li.classList.remove('dragging')
+      document.querySelectorAll('.drop-target').forEach(el => el.classList.remove('drop-target'))
+    })
+    if (isC) {
+      li.addEventListener('dragover', (e) => {
+        if (!state.dragSource || state.dragSource === id) return
+        // Don't drop a container into itself or a descendant
+        if (state.dragSource.endsWith('/') && id.startsWith(state.dragSource)) return
+        e.preventDefault()
+        e.dataTransfer.dropEffect = 'move'
+        li.classList.add('drop-target')
+      })
+      li.addEventListener('dragleave', () => li.classList.remove('drop-target'))
+      li.addEventListener('drop', (e) => {
+        e.preventDefault()
+        li.classList.remove('drop-target')
+        const src = state.dragSource
+        if (!src || src === id) return
+        moveItem(src, id)
+      })
+    }
     listEl.appendChild(li)
   }
 }
@@ -567,12 +606,18 @@ function refresh() {
 
 // --- delete (soft, with undo) ---
 
+function isInTrash(url) {
+  return url && url.includes(TRASH_PATH)
+}
+
 async function softDelete(url) {
   if (!url) return
   if (!meWebId()) {
     showToast('Login required to delete.', null, null, 3000)
     return
   }
+  // Inside trash: permanent delete (skip the roundtrip)
+  if (isInTrash(url)) return permanentDelete(url)
   if (!state.ownPod) {
     showToast('Cannot find your pod root for trash. Login may be incomplete.', null, null, 4000)
     return
@@ -581,6 +626,183 @@ async function softDelete(url) {
     return softDeleteContainer(url)
   }
   return softDeleteResource(url)
+}
+
+async function permanentDelete(url) {
+  const name = decodeURIComponent(url.replace(/\/$/, '').split('/').pop() || '')
+  const isC = isContainer(url)
+  if (!confirm(`Permanently delete "${name}${isC ? '/' : ''}"? This cannot be undone.`)) return
+  setBusy(true, 'deleting…')
+  try {
+    if (isC) {
+      const cs = [], ls = []
+      await walkTree(url, cs, ls)
+      for (const leaf of ls) {
+        const d = await authFetch(leaf, { method: 'DELETE' })
+        if (!d.ok) throw new Error(`delete ${leaf}: ${d.status}`)
+      }
+      cs.sort((a, b) => b.length - a.length)
+      for (const c of cs) {
+        await authFetch(c, { method: 'DELETE' }).catch(() => {})
+      }
+    } else {
+      const r = await authFetch(url, { method: 'DELETE' })
+      if (!r.ok) throw new Error(`${r.status}`)
+    }
+    setBusy(false, 'idle')
+    refresh()
+    showToast(`Permanently deleted "${name}"`, null, null, 2500)
+  } catch (e) {
+    setBusy(false, e.message, 'error')
+    showToast(`Couldn't delete: ${e.message}`, null, null, 5000)
+  }
+}
+
+// --- copy-and-delete primitive (shared by rename + move) ---
+
+// LDP has no native MOVE / COPY / RENAME. Everything is read source → write dest → delete source.
+async function copyAndDelete(srcUrl, destUrl) {
+  if (srcUrl === destUrl) return
+  if (isContainer(srcUrl)) return copyAndDeleteContainer(srcUrl, destUrl)
+  return copyAndDeleteResource(srcUrl, destUrl)
+}
+
+async function copyAndDeleteResource(srcUrl, destUrl) {
+  // Refuse to overwrite existing destination
+  try {
+    const h = await authFetch(destUrl, { method: 'HEAD' })
+    if (h.ok) throw new Error(`destination exists: ${destUrl.split('/').pop()}`)
+  } catch (e) {
+    // Network errors on HEAD: treat as "doesn't exist" and proceed
+    if (e.message.startsWith('destination exists')) throw e
+  }
+  const r = await authFetch(srcUrl)
+  if (!r.ok) throw new Error(`read source: ${r.status}`)
+  const ct = r.headers.get('content-type') || 'application/octet-stream'
+  const blob = await r.blob()
+  const w = await authFetch(destUrl, {
+    method: 'PUT',
+    headers: { 'Content-Type': ct },
+    body: blob
+  })
+  if (!w.ok) throw new Error(`write dest: ${w.status}`)
+  const d = await authFetch(srcUrl, { method: 'DELETE' })
+  if (!d.ok) {
+    // Roll back: delete what we just wrote
+    authFetch(destUrl, { method: 'DELETE' }).catch(() => {})
+    throw new Error(`delete source: ${d.status}`)
+  }
+}
+
+async function copyAndDeleteContainer(srcUrl, destUrl) {
+  const containers = []
+  const leaves = []
+  await walkTree(srcUrl, containers, leaves)
+  for (const leafUrl of leaves) {
+    const rel = leafUrl.slice(srcUrl.length)
+    await copyAndDeleteResource(leafUrl, destUrl + rel)
+  }
+  // Delete the now-empty source containers deepest-first
+  containers.sort((a, b) => b.length - a.length)
+  for (const c of containers) {
+    await authFetch(c, { method: 'DELETE' }).catch(() => {})
+  }
+}
+
+// --- rename ---
+
+async function renameItem(srcUrl, newName) {
+  const parent = parentOf(srcUrl)
+  if (!parent) throw new Error('cannot rename the pod root')
+  const trailing = isContainer(srcUrl) ? '/' : ''
+  const destUrl = parent + encodeURIComponent(newName) + trailing
+  if (destUrl === srcUrl) return srcUrl
+  await copyAndDelete(srcUrl, destUrl)
+  return destUrl
+}
+
+function beginRename(li) {
+  if (!li) return
+  const url = li.dataset.url
+  if (!url || isInTrash(url)) return  // can't rename in trash
+  const labelEl = li.querySelector('.row-label')
+  if (!labelEl) return
+  const isC = isContainer(url)
+  const currentName = decodeURIComponent(url.replace(/\/$/, '').split('/').pop() || '')
+
+  const originalHtml = labelEl.innerHTML
+  const input = document.createElement('input')
+  input.type = 'text'
+  input.value = currentName
+  input.className = 'rename-input'
+  input.setAttribute('aria-label', 'New name')
+  labelEl.innerHTML = ''
+  labelEl.appendChild(input)
+  input.focus()
+  input.select()
+
+  let done = false
+  const cleanup = () => {
+    if (done) return
+    done = true
+    labelEl.innerHTML = originalHtml
+  }
+  const commit = async () => {
+    if (done) return
+    const newName = input.value.trim()
+    if (!newName || newName === currentName) { cleanup(); return }
+    if (newName.includes('/') || newName.includes('\\')) {
+      showToast('Name cannot contain / or \\.', null, null, 3500)
+      cleanup()
+      return
+    }
+    done = true
+    setBusy(true, `renaming "${currentName}" → "${newName}"…`)
+    try {
+      await renameItem(url, newName)
+      setBusy(false, 'idle')
+      refresh()
+      showToast(`Renamed to "${newName}"`, null, null, 2500)
+    } catch (e) {
+      setBusy(false, e.message, 'error')
+      showToast(`Couldn't rename: ${e.message}`, null, null, 5000)
+      // Force refresh to recover from any partial state
+      refresh()
+    }
+  }
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation()  // don't fall through to global keyboard handler
+    if (e.key === 'Enter') { e.preventDefault(); commit() }
+    else if (e.key === 'Escape') { e.preventDefault(); cleanup() }
+  })
+  input.addEventListener('blur', commit)
+  input.addEventListener('click', e => e.stopPropagation())
+  input.addEventListener('dblclick', e => e.stopPropagation())
+}
+
+// --- move ---
+
+async function moveItem(srcUrl, targetContainerUrl) {
+  if (!targetContainerUrl.endsWith('/')) targetContainerUrl += '/'
+  const trailing = isContainer(srcUrl) ? '/' : ''
+  const name = decodeURIComponent(srcUrl.replace(/\/$/, '').split('/').pop() || '')
+  const destUrl = targetContainerUrl + encodeURIComponent(name) + trailing
+  if (destUrl === srcUrl) return
+  // Disallow moving a container into itself or a descendant
+  if (isContainer(srcUrl) && targetContainerUrl.startsWith(srcUrl)) {
+    throw new Error('cannot move a container into itself')
+  }
+  setBusy(true, `moving "${name}"…`)
+  try {
+    await copyAndDelete(srcUrl, destUrl)
+    setBusy(false, 'idle')
+    refresh()
+    showToast(`Moved "${name}" → ${decodeURIComponent(targetContainerUrl.split('/').slice(-2, -1)[0] || '/')}/`, null, null, 2500)
+  } catch (e) {
+    setBusy(false, e.message, 'error')
+    showToast(`Couldn't move: ${e.message}`, null, null, 5000)
+    refresh()
+  }
 }
 
 async function softDeleteResource(url) {
@@ -986,6 +1208,12 @@ function bindKeyboard() {
     } else if (e.key === 'u' || e.key === 'U') {
       e.preventDefault()
       document.getElementById('file-picker').click()
+    } else if (e.key === 'F2') {
+      if (state.focusedIndex < 0 || !state.items[state.focusedIndex]) return
+      e.preventDefault()
+      const id = state.items[state.focusedIndex]['@id']
+      const li = document.querySelector(`#listing li[data-url="${CSS.escape(id)}"]`)
+      beginRename(li)
     }
   })
 }
