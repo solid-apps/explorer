@@ -24,6 +24,8 @@ const state = {
 }
 
 const TRASH_PATH = '/private/.trash/'
+const DEFAULT_URL = 'http://localhost:4443/public/'
+const LS_LAST_URL = 'explorer.lastUrl'
 let toastTimer = null
 
 // --- auth + fetch helpers ---
@@ -132,6 +134,8 @@ async function navigateTo(rawUrl, options = {}) {
   state.selectedItem = null
   syncUrl()
   renderBreadcrumb()
+  // Remember the last successful URL so the next session opens here
+  try { localStorage.setItem(LS_LAST_URL, url) } catch {}
   setBusy(true, `loading ${url}`)
   hidePreview()
   try {
@@ -523,6 +527,27 @@ function bindButtons() {
   document.getElementById('btn-close-preview').addEventListener('click', hidePreview)
   document.getElementById('toast-close').addEventListener('click', hideToast)
 
+  // New… menu
+  document.getElementById('btn-new').addEventListener('click', (e) => {
+    e.stopPropagation()
+    togglePopover()
+  })
+  document.querySelectorAll('#popover-new .popover-item').forEach(btn => {
+    btn.addEventListener('click', () => {
+      togglePopover(false)
+      const action = btn.dataset.action
+      if (action === 'container') newContainer()
+      else if (action === 'file') newFile()
+      else if (action === 'upload') document.getElementById('file-picker').click()
+    })
+  })
+
+  // File picker
+  document.getElementById('file-picker').addEventListener('change', (e) => {
+    uploadFiles(e.target.files)
+    e.target.value = ''  // reset so re-picking same file fires change
+  })
+
   // Delegate clicks on links inside the preview body to navigate within the app
   document.getElementById('preview-body').addEventListener('click', (e) => {
     const a = e.target.closest('a[data-link]')
@@ -544,52 +569,49 @@ function refresh() {
 
 async function softDelete(url) {
   if (!url) return
-  if (isContainer(url)) {
-    showToast('Cannot delete containers yet (only resources).', null, null, 4000)
-    return
-  }
   if (!meWebId()) {
     showToast('Login required to delete.', null, null, 3000)
     return
   }
-  // Determine the trash destination on the user's own pod
   if (!state.ownPod) {
     showToast('Cannot find your pod root for trash. Login may be incomplete.', null, null, 4000)
     return
   }
+  if (isContainer(url)) {
+    return softDeleteContainer(url)
+  }
+  return softDeleteResource(url)
+}
+
+async function softDeleteResource(url) {
   const original = url
   const name = decodeURIComponent(original.replace(/\/$/, '').split('/').pop() || 'untitled')
   const ts = new Date().toISOString().replace(/[:.]/g, '-')
   const trashUrl = `${state.ownPod}${TRASH_PATH}${ts}-${name}`
   setBusy(true, 'moving to trash…')
+  let ct
   try {
-    // Read source
     const r = await authFetch(original)
     if (!r.ok) throw new Error(`read source: ${r.status}`)
-    const ct = r.headers.get('content-type') || 'application/octet-stream'
+    ct = r.headers.get('content-type') || 'application/octet-stream'
     const blob = await r.blob()
-    // Write to trash
     const w = await authFetch(trashUrl, {
       method: 'PUT',
       headers: { 'Content-Type': ct },
       body: blob
     })
     if (!w.ok) throw new Error(`write trash: ${w.status}`)
-    // Delete original
     const d = await authFetch(original, { method: 'DELETE' })
     if (!d.ok) {
-      // Best-effort cleanup of orphaned trash
       authFetch(trashUrl, { method: 'DELETE' }).catch(() => {})
       throw new Error(`delete original: ${d.status}`)
     }
     setBusy(false, 'idle')
-    // Refresh listing to drop the deleted item
     refresh()
-    // Toast with undo
     showToast(
       `Moved “${name}” to Trash`,
       'Undo',
-      () => undoSoftDelete(original, trashUrl, ct),
+      () => undoSoftDelete([{ originalUrl: original, trashUrl, ct }]),
       8000
     )
   } catch (e) {
@@ -598,20 +620,92 @@ async function softDelete(url) {
   }
 }
 
-async function undoSoftDelete(originalUrl, trashUrl, ct) {
-  setBusy(true, 'restoring…')
+async function softDeleteContainer(url) {
+  const name = decodeURIComponent(url.replace(/\/$/, '').split('/').pop() || 'untitled')
+  if (!confirm(`Delete container "${name}" and everything inside it?`)) return
+  const ts = new Date().toISOString().replace(/[:.]/g, '-')
+  const trashBase = `${state.ownPod}${TRASH_PATH}${ts}-${name}/`
+  setBusy(true, `moving "${name}" to trash…`)
+  const restores = []  // each: { originalUrl, trashUrl, ct } for undo
   try {
-    const r = await authFetch(trashUrl)
-    if (!r.ok) throw new Error(`read trash: ${r.status}`)
-    const blob = await r.blob()
-    const w = await authFetch(originalUrl, {
-      method: 'PUT',
-      headers: { 'Content-Type': ct || 'application/octet-stream' },
-      body: blob
-    })
-    if (!w.ok) throw new Error(`restore: ${w.status}`)
-    // Clean up the trash copy
-    authFetch(trashUrl, { method: 'DELETE' }).catch(() => {})
+    // Walk the tree. For each leaf, copy to a path-preserving trash URL,
+    // then DELETE source. After leaves, DELETE empty containers
+    // (deepest-first).
+    const allContainers = []  // deepest first after sort
+    const allLeaves = []      // collected during walk
+    await walkTree(url, allContainers, allLeaves)
+
+    // Move each leaf to trash
+    for (const leafUrl of allLeaves) {
+      const relPath = leafUrl.slice(url.length)
+      const trashUrl = trashBase + relPath
+      const r = await authFetch(leafUrl)
+      if (!r.ok) throw new Error(`read ${leafUrl}: ${r.status}`)
+      const ct = r.headers.get('content-type') || 'application/octet-stream'
+      const blob = await r.blob()
+      const w = await authFetch(trashUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': ct },
+        body: blob
+      })
+      if (!w.ok) throw new Error(`write trash for ${leafUrl}: ${w.status}`)
+      const d = await authFetch(leafUrl, { method: 'DELETE' })
+      if (!d.ok) throw new Error(`delete ${leafUrl}: ${d.status}`)
+      restores.push({ originalUrl: leafUrl, trashUrl, ct })
+    }
+    // Delete now-empty containers, deepest first
+    allContainers.sort((a, b) => b.length - a.length)
+    for (const c of allContainers) {
+      await authFetch(c, { method: 'DELETE' }).catch(() => {})  // best-effort
+    }
+    setBusy(false, 'idle')
+    refresh()
+    const n = restores.length
+    showToast(
+      `Moved "${name}" (${n} item${n === 1 ? '' : 's'}) to Trash`,
+      'Undo',
+      () => undoSoftDelete(restores),
+      10000
+    )
+  } catch (e) {
+    setBusy(false, e.message, 'error')
+    showToast(`Couldn't delete container: ${e.message}`, null, null, 6000)
+  }
+}
+
+async function walkTree(containerUrl, outContainers, outLeaves) {
+  const r = await authFetch(containerUrl, { headers: { Accept: 'application/ld+json' } })
+  if (!r.ok) throw new Error(`list ${containerUrl}: ${r.status}`)
+  const doc = await r.json()
+  outContainers.push(containerUrl)
+  const contains = doc['ldp:contains'] || doc['http://www.w3.org/ns/ldp#contains'] || doc['contains'] || []
+  const arr = Array.isArray(contains) ? contains : [contains]
+  for (const x of arr) {
+    const id = typeof x === 'string' ? x : x['@id']
+    if (!id) continue
+    if (isContainer(id)) {
+      await walkTree(id, outContainers, outLeaves)
+    } else {
+      outLeaves.push(id)
+    }
+  }
+}
+
+async function undoSoftDelete(restores) {
+  setBusy(true, `restoring ${restores.length} item${restores.length === 1 ? '' : 's'}…`)
+  try {
+    for (const { originalUrl, trashUrl, ct } of restores) {
+      const r = await authFetch(trashUrl)
+      if (!r.ok) throw new Error(`read trash ${trashUrl}: ${r.status}`)
+      const blob = await r.blob()
+      const w = await authFetch(originalUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': ct || 'application/octet-stream' },
+        body: blob
+      })
+      if (!w.ok) throw new Error(`restore ${originalUrl}: ${w.status}`)
+      authFetch(trashUrl, { method: 'DELETE' }).catch(() => {})
+    }
     setBusy(false, 'idle')
     refresh()
     showToast('Restored', null, null, 2000)
@@ -619,6 +713,206 @@ async function undoSoftDelete(originalUrl, trashUrl, ct) {
     setBusy(false, e.message, 'error')
     showToast(`Couldn't restore: ${e.message}`, null, null, 5000)
   }
+}
+
+// --- create container / file ---
+
+async function newContainer() {
+  if (!isContainer(state.here)) {
+    showToast('Navigate to a container first.', null, null, 3000)
+    return
+  }
+  const raw = prompt('New container name:')
+  if (!raw) return
+  const name = raw.trim().replace(/[/\\]/g, '-')
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_. -]*$/.test(name)) {
+    showToast('Invalid name. Use letters, numbers, _ . - and spaces.', null, null, 4000)
+    return
+  }
+  setBusy(true, 'creating container…')
+  try {
+    // LDP POST: server creates a child container based on Slug + Link
+    const r = await authFetch(state.here, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/turtle',
+        'Slug': name,
+        'Link': '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"'
+      },
+      body: ''
+    })
+    if (!r.ok) throw new Error(`POST → ${r.status}`)
+    setBusy(false, 'idle')
+    refresh()
+    showToast(`Created "${name}/"`, null, null, 2500)
+  } catch (e) {
+    setBusy(false, e.message, 'error')
+    showToast(`Couldn't create container: ${e.message}`, null, null, 5000)
+  }
+}
+
+const EXTENSION_TYPES = {
+  txt: 'text/plain',
+  md:  'text/markdown',
+  html:'text/html',
+  htm: 'text/html',
+  css: 'text/css',
+  js:  'application/javascript',
+  json:'application/json',
+  jsonld:'application/ld+json',
+  ttl: 'text/turtle',
+  csv: 'text/csv',
+  xml: 'application/xml',
+  svg: 'image/svg+xml',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg:'image/jpeg',
+  gif: 'image/gif',
+  webp:'image/webp',
+  pdf: 'application/pdf',
+  mp3: 'audio/mpeg',
+  m4a: 'audio/mp4',
+  wav: 'audio/wav',
+  ogg: 'audio/ogg',
+  mp4: 'video/mp4',
+  webm:'video/webm'
+}
+
+function contentTypeFromName(name) {
+  const i = name.lastIndexOf('.')
+  if (i < 0) return 'text/plain'
+  const ext = name.slice(i + 1).toLowerCase()
+  return EXTENSION_TYPES[ext] || 'application/octet-stream'
+}
+
+async function newFile() {
+  if (!isContainer(state.here)) {
+    showToast('Navigate to a container first.', null, null, 3000)
+    return
+  }
+  const raw = prompt('New file name (e.g. notes.md):')
+  if (!raw) return
+  const name = raw.trim().replace(/[/\\]/g, '-')
+  if (!name || name.startsWith('.')) {
+    showToast('Invalid name.', null, null, 4000)
+    return
+  }
+  const ct = contentTypeFromName(name)
+  const url = state.here + encodeURIComponent(name)
+  setBusy(true, 'creating file…')
+  try {
+    const r = await authFetch(url, {
+      method: 'PUT',
+      headers: { 'Content-Type': ct },
+      body: ''
+    })
+    if (!r.ok) throw new Error(`PUT → ${r.status}`)
+    setBusy(false, 'idle')
+    refresh()
+    showToast(`Created "${name}"`, null, null, 2500)
+  } catch (e) {
+    setBusy(false, e.message, 'error')
+    showToast(`Couldn't create file: ${e.message}`, null, null, 5000)
+  }
+}
+
+// --- upload ---
+
+async function uploadFiles(fileList) {
+  if (!fileList || fileList.length === 0) return
+  if (!isContainer(state.here)) {
+    showToast('Navigate to a container first.', null, null, 3000)
+    return
+  }
+  if (!meWebId()) {
+    showToast('Login required to upload.', null, null, 3000)
+    return
+  }
+  const files = Array.from(fileList)
+  let ok = 0
+  let fail = 0
+  setBusy(true, `uploading 0 / ${files.length}…`)
+  // Concurrency 3
+  const queue = files.slice()
+  async function worker() {
+    while (queue.length > 0) {
+      const file = queue.shift()
+      if (!file) return
+      try {
+        const safeName = file.name.replace(/[/\\]/g, '-')
+        const url = state.here + encodeURIComponent(safeName)
+        const ct = file.type || contentTypeFromName(safeName)
+        const r = await authFetch(url, {
+          method: 'PUT',
+          headers: { 'Content-Type': ct },
+          body: file
+        })
+        if (!r.ok) throw new Error(`${r.status}`)
+        ok++
+      } catch {
+        fail++
+      }
+      setBusy(true, `uploading ${ok + fail} / ${files.length}…`)
+    }
+  }
+  await Promise.all([worker(), worker(), worker()])
+  setBusy(false, 'idle')
+  refresh()
+  if (fail === 0) {
+    showToast(`Uploaded ${ok} file${ok === 1 ? '' : 's'}`, null, null, 3000)
+  } else {
+    showToast(`Uploaded ${ok}, failed ${fail}`, null, null, 5000)
+  }
+}
+
+// --- popover ---
+
+function togglePopover(force) {
+  const pop = document.getElementById('popover-new')
+  const open = force != null ? force : pop.hidden
+  pop.hidden = !open
+  if (open) {
+    // close on outside click
+    setTimeout(() => {
+      document.addEventListener('click', closeOnOutside, { once: true })
+    }, 0)
+  }
+}
+function closeOnOutside(e) {
+  const host = e.target.closest('.popover-host')
+  if (!host) togglePopover(false)
+}
+
+// --- drag-drop ---
+
+function bindDragDrop() {
+  const wrap = document.getElementById('listing-wrap')
+  const overlay = document.getElementById('drop-overlay')
+  let counter = 0  // dragenter/leave can fire on children; use ref-count
+  wrap.addEventListener('dragenter', (e) => {
+    if (!e.dataTransfer || !e.dataTransfer.types.includes('Files')) return
+    counter++
+    overlay.hidden = false
+  })
+  wrap.addEventListener('dragleave', () => {
+    counter--
+    if (counter <= 0) {
+      counter = 0
+      overlay.hidden = true
+    }
+  })
+  wrap.addEventListener('dragover', (e) => {
+    if (!e.dataTransfer || !e.dataTransfer.types.includes('Files')) return
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'copy'
+  })
+  wrap.addEventListener('drop', (e) => {
+    if (!e.dataTransfer || !e.dataTransfer.files || e.dataTransfer.files.length === 0) return
+    e.preventDefault()
+    counter = 0
+    overlay.hidden = true
+    uploadFiles(e.dataTransfer.files)
+  })
 }
 
 // --- toast ---
@@ -686,6 +980,12 @@ function bindKeyboard() {
       e.preventDefault()
       document.getElementById('url').focus()
       document.getElementById('url').select()
+    } else if (e.key === 'n' || e.key === 'N') {
+      e.preventDefault()
+      togglePopover(true)
+    } else if (e.key === 'u' || e.key === 'U') {
+      e.preventDefault()
+      document.getElementById('file-picker').click()
     }
   })
 }
@@ -706,20 +1006,25 @@ function focusItem(index) {
 function init() {
   bindButtons()
   bindKeyboard()
+  bindDragDrop()
   renderIdentity()
   watchLogin()
   refreshNavButtons()
 
-  // Take URL from ?url= param if present
+  // Pick a starting URL with sensible fallbacks:
+  //   1. ?url= query param (deep-link)
+  //   2. last visited URL from localStorage
+  //   3. logged-in user's pod /public/ (if already authed at init)
+  //   4. DEFAULT_URL (http://localhost:4443/)
   const params = new URLSearchParams(location.search)
-  const startUrl = params.get('url')
-  if (startUrl) {
-    navigateTo(decodeURIComponent(startUrl))
-    return
+  let startUrl = params.get('url')
+  if (startUrl) startUrl = decodeURIComponent(startUrl)
+  if (!startUrl) {
+    try { startUrl = localStorage.getItem(LS_LAST_URL) || null } catch { startUrl = null }
   }
-  // Otherwise, if logged in, jump to /public/ on the user's pod
-  // (renderIdentity already filled the input with a guess).
-  setBusy(false, 'enter a pod URL above')
+  if (!startUrl && meWebId() && state.ownPod) startUrl = state.ownPod + '/public/'
+  if (!startUrl) startUrl = DEFAULT_URL
+  navigateTo(startUrl)
 }
 
 if (document.readyState === 'loading') {
